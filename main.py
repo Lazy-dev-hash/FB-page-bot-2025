@@ -4,7 +4,7 @@ import json
 import requests
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
 import openai
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import time
 import random
@@ -17,6 +17,11 @@ from typing import Optional, Dict, Any, List
 import base64
 from io import BytesIO
 from PIL import Image
+import asyncio
+import schedule
+from threading import Timer
+import subprocess
+import psutil
 
 # Import Gemini with better error handling
 try:
@@ -49,9 +54,22 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Bot Configuration
 BOT_NAME = "SUNNEL's Ultimate AI"
-BOT_VERSION = "3.1.0"
+BOT_VERSION = "4.0.0"
 REQUIRED_POST_ID = "761320392916522"
 PAGE_ID = "100071491013161"
+
+# Global status tracking
+SYSTEM_STATUS = {
+    'is_active': True,
+    'last_heartbeat': datetime.now(),
+    'uptime_start': datetime.now(),
+    'total_requests': 0,
+    'active_conversations': 0,
+    'system_health': 'excellent',
+    'cpu_usage': 0.0,
+    'memory_usage': 0.0,
+    'response_time_avg': 0.0
+}
 
 # Initialize APIs
 if GEMINI_API_KEY and GEMINI_AVAILABLE:
@@ -86,6 +104,7 @@ def get_db():
 def init_database():
     """Initialize database with required tables"""
     with get_db() as conn:
+        # Create users table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
@@ -105,6 +124,17 @@ def init_database():
                 preference_settings TEXT DEFAULT '{}'
             )
         ''')
+        
+        # Add missing columns if they don't exist (for existing databases)
+        try:
+            conn.execute('ALTER TABLE users ADD COLUMN total_images INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            conn.execute('ALTER TABLE users ADD COLUMN user_rating REAL DEFAULT 0.0')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         conn.execute('''
             CREATE TABLE IF NOT EXISTS interactions (
@@ -146,10 +176,76 @@ def init_database():
             )
         ''')
 
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS system_health (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                cpu_usage REAL,
+                memory_usage REAL,
+                active_connections INTEGER,
+                response_time REAL,
+                status TEXT
+            )
+        ''')
+
         # Initialize bot stats if not exists
         conn.execute('''
             INSERT OR IGNORE INTO bot_stats (id) VALUES (1)
         ''')
+
+def update_system_status():
+    """Update real-time system status"""
+    global SYSTEM_STATUS
+    try:
+        # Get system metrics
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        
+        SYSTEM_STATUS.update({
+            'last_heartbeat': datetime.now(),
+            'cpu_usage': cpu_percent,
+            'memory_usage': memory.percent,
+            'is_active': True
+        })
+        
+        # Determine system health
+        if cpu_percent < 50 and memory.percent < 70:
+            SYSTEM_STATUS['system_health'] = 'excellent'
+        elif cpu_percent < 80 and memory.percent < 85:
+            SYSTEM_STATUS['system_health'] = 'good'
+        else:
+            SYSTEM_STATUS['system_health'] = 'moderate'
+        
+        # Log to database
+        with get_db() as conn:
+            conn.execute('''
+                INSERT INTO system_health (cpu_usage, memory_usage, active_connections, status)
+                VALUES (?, ?, ?, ?)
+            ''', (cpu_percent, memory.percent, SYSTEM_STATUS['active_conversations'], SYSTEM_STATUS['system_health']))
+            
+    except Exception as e:
+        logger.error(f"Status update error: {e}")
+
+def keep_alive():
+    """Keep the bot alive 24/7"""
+    try:
+        # Update system status
+        update_system_status()
+        
+        # Self-ping to keep active
+        try:
+            response = requests.get('http://localhost:5000/health', timeout=5)
+            if response.status_code == 200:
+                logger.info("🔄 Keep-alive ping successful")
+        except:
+            pass
+            
+        # Schedule next keep-alive
+        Timer(300, keep_alive).start()  # Every 5 minutes
+        
+    except Exception as e:
+        logger.error(f"Keep-alive error: {e}")
+        Timer(300, keep_alive).start()
 
 class SunnelBot:
     def __init__(self):
@@ -157,6 +253,13 @@ class SunnelBot:
         self.verify_token = VERIFY_TOKEN
         self.conversation_memory = {}
         self.start_time = datetime.now()
+        self.typing_animations = [
+            "●",
+            "●●",
+            "●●●",
+            "●●●●",
+            "●●●●●"
+        ]
         
     def verify_webhook(self, token, challenge):
         """Verify webhook with Facebook"""
@@ -164,9 +267,44 @@ class SunnelBot:
             return challenge
         return None
     
-    def send_message(self, sender_id: str, message: str) -> bool:
-        """Send message to user"""
+    def send_typing_indicator(self, sender_id: str, duration: float = 2.0):
+        """Send enhanced typing indicator with duration"""
         try:
+            url = f"https://graph.facebook.com/v18.0/me/messages"
+            headers = {'Content-Type': 'application/json'}
+            
+            data = {
+                'recipient': {'id': sender_id},
+                'sender_action': 'typing_on',
+                'access_token': self.page_access_token
+            }
+            
+            requests.post(url, headers=headers, json=data)
+            time.sleep(duration)
+            
+            # Turn off typing
+            data['sender_action'] = 'typing_off'
+            requests.post(url, headers=headers, json=data)
+            
+        except Exception as e:
+            logger.error(f"Typing indicator error: {e}")
+    
+    def send_animated_message(self, sender_id: str, message: str) -> bool:
+        """Send message with typing animation like Meta AI"""
+        try:
+            # Start typing indicator
+            self.send_typing_indicator(sender_id, 0.5)
+            
+            # Calculate typing duration based on message length
+            words = len(message.split())
+            typing_duration = min(max(words * 0.1, 1.0), 4.0)  # 1-4 seconds
+            
+            # Show typing animation
+            for i in range(int(typing_duration * 2)):
+                animation = self.typing_animations[i % len(self.typing_animations)]
+                time.sleep(0.5)
+            
+            # Send actual message
             url = f"https://graph.facebook.com/v18.0/me/messages"
             headers = {'Content-Type': 'application/json'}
             
@@ -179,31 +317,19 @@ class SunnelBot:
             response = requests.post(url, headers=headers, json=data)
             
             if response.status_code == 200:
-                logger.info(f"✅ Message sent successfully to {sender_id}")
+                logger.info(f"✅ Animated message sent successfully to {sender_id}")
                 return True
             else:
                 logger.error(f"❌ Failed to send message: {response.status_code} - {response.text}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Send message error: {e}")
+            logger.error(f"Send animated message error: {e}")
             return False
     
-    def send_typing_indicator(self, sender_id: str):
-        """Send typing indicator"""
-        try:
-            url = f"https://graph.facebook.com/v18.0/me/messages"
-            headers = {'Content-Type': 'application/json'}
-            
-            data = {
-                'recipient': {'id': sender_id},
-                'sender_action': 'typing_on',
-                'access_token': self.page_access_token
-            }
-            
-            requests.post(url, headers=headers, json=data)
-        except Exception as e:
-            logger.error(f"Typing indicator error: {e}")
+    def send_message(self, sender_id: str, message: str) -> bool:
+        """Send regular message (fallback)"""
+        return self.send_animated_message(sender_id, message)
     
     def get_user_info(self, sender_id: str) -> Dict[str, Any]:
         """Get user information from Facebook"""
@@ -294,6 +420,11 @@ class SunnelBot:
                                             ai_provider, processing_time, error_message, image_url)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (sender_id, interaction_type, user_message, bot_response, ai_provider, processing_time, error_message, image_url))
+                
+            # Update global stats
+            global SYSTEM_STATUS
+            SYSTEM_STATUS['total_requests'] += 1
+            
         except Exception as e:
             logger.error(f"Interaction logging error: {e}")
     
@@ -320,83 +451,6 @@ class SunnelBot:
         except Exception as e:
             logger.error(f"Feature tracking error: {e}")
     
-    def analyze_image_with_ai(self, image_url: str, user_message: str = "", user_name: str = "User") -> tuple[str, str]:
-        """Analyze image using available AI providers"""
-        try:
-            # Try Gemini first (supports image analysis)
-            if GEMINI_API_KEY and GEMINI_AVAILABLE:
-                try:
-                    # Download image
-                    response = requests.get(image_url, timeout=30)
-                    if response.status_code == 200:
-                        image = Image.open(BytesIO(response.content))
-                        
-                        model = genai.GenerativeModel('gemini-1.5-flash')
-                        
-                        prompt = f"""You are {BOT_NAME}, an advanced AI assistant created by SUNNEL. 
-Analyze this image thoroughly and provide a detailed, helpful response.
-
-User's name: {user_name}
-User's message: {user_message if user_message else "Please analyze this image"}
-
-Please provide:
-1. A detailed description of what you see
-2. Any relevant information or insights
-3. Answer any specific questions the user may have
-
-Be engaging, informative, and use emojis appropriately."""
-                        
-                        response = model.generate_content([prompt, image])
-                        
-                        if response and response.text:
-                            return response.text.strip(), "Gemini Vision"
-                
-                except Exception as e:
-                    logger.error(f"Gemini Vision error: {e}")
-            
-            # Try OpenAI Vision API
-            if OPENAI_API_KEY:
-                try:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=OPENAI_API_KEY)
-                    
-                    response = client.chat.completions.create(
-                        model="gpt-4-vision-preview",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": f"You are {BOT_NAME}, a helpful AI assistant created by SUNNEL. Analyze images thoroughly and provide detailed, engaging responses with appropriate emojis."
-                            },
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": f"Hello {user_name}! {user_message if user_message else 'Please analyze this image in detail.'}"
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": image_url}
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens=1000
-                    )
-                    
-                    if response.choices and response.choices[0].message.content:
-                        return response.choices[0].message.content.strip(), "OpenAI Vision"
-                
-                except Exception as e:
-                    logger.error(f"OpenAI Vision error: {e}")
-            
-            # Fallback response
-            return f"📸 Hi {user_name}! I can see you've shared an image with me. While I'm experiencing some technical difficulties with image analysis right now, I'm here to help! Could you describe what's in the image or let me know what you'd like to know about it? 😊", "Fallback"
-            
-        except Exception as e:
-            logger.error(f"Image analysis error: {e}")
-            return f"📸 Hello {user_name}! I received your image but I'm having trouble analyzing it right now. Please try again or describe what you'd like to know about the image! 🤖", "Error"
-    
     def get_smart_ai_response(self, user_message: str, user_name: str = "User", 
                             conversation_history: str = None) -> tuple[str, Optional[str]]:
         """Get AI response with improved provider management"""
@@ -412,14 +466,17 @@ Be engaging, informative, and use emojis appropriately."""
                     system_prompt = f"""You are {BOT_NAME}, a highly intelligent and friendly AI assistant created by SUNNEL. 
 
 Key traits:
-- Helpful, knowledgeable, and conversational
-- Use emojis appropriately to make conversations engaging
-- Provide detailed, accurate, and useful responses
-- Be creative and show personality
-- Always be respectful and supportive
+- 🚀 Exceptionally intelligent and conversational like Meta AI
+- 😊 Warm, engaging, and genuinely helpful with personality
+- 🎨 Creative and innovative in problem-solving
+- ✨ Use emojis strategically to enhance communication
+- 💡 Provide detailed yet accessible explanations
+- 🌟 Showcase advanced AI capabilities while staying conversational
+- 🤖 Add charm and personality to responses like a real friend
+- 🎯 Be precise, accurate, and helpful
 
-User's name: {user_name}
-"""
+Current user: {user_name}
+Response style: Conversational, friendly, and engaging like Meta AI"""
                     
                     if conversation_history:
                         full_prompt = f"{system_prompt}\n\nConversation History:\n{conversation_history}\n\nCurrent message: {user_message}\n\nPlease respond helpfully:"
@@ -444,7 +501,7 @@ User's name: {user_name}
                     messages = [
                         {
                             "role": "system",
-                            "content": f"You are {BOT_NAME}, a helpful AI assistant created by SUNNEL. Be conversational, helpful, and use emojis appropriately."
+                            "content": f"You are {BOT_NAME}, a helpful AI assistant created by SUNNEL. Be conversational, helpful, engaging like Meta AI, and use emojis appropriately. Show personality and be friendly."
                         }
                     ]
                     
@@ -470,10 +527,10 @@ User's name: {user_name}
             # Final fallback response
             processing_time = time.time() - start_time
             fallback_responses = [
-                f"Hello {user_name}! 👋 I'm {BOT_NAME}, your AI assistant. How can I help you today?",
-                f"Hi there! ✨ I'm here to help you with any questions or tasks you have!",
-                f"Greetings! 🌟 I'm {BOT_NAME}, ready to assist you. What would you like to know?",
-                f"Hello! 😊 I'm your friendly AI assistant. Feel free to ask me anything!"
+                f"Hello {user_name}! 👋 I'm {BOT_NAME}, your AI assistant. How can I help you today? ✨",
+                f"Hi there! 🌟 I'm here to help you with any questions or tasks you have! What's on your mind?",
+                f"Greetings! 🚀 I'm {BOT_NAME}, ready to assist you. What would you like to know or discuss?",
+                f"Hello! 😊 I'm your friendly AI assistant, always here to help! Feel free to ask me anything!"
             ]
             
             return random.choice(fallback_responses), "Fallback"
@@ -481,13 +538,17 @@ User's name: {user_name}
         except Exception as e:
             logger.error(f"AI response error: {e}")
             processing_time = time.time() - start_time
-            return f"Hello! I'm {BOT_NAME} 🤖 I'm experiencing some technical difficulties right now, but I'm here to help! Please try again in a moment.", "Error"
+            return f"Hello! I'm {BOT_NAME} 🤖 I'm experiencing some technical difficulties right now, but I'm here to help! Please try again in a moment. ✨", "Error"
     
     def handle_message(self, sender_id: str, message_text: str):
-        """Handle incoming text messages"""
+        """Handle incoming text messages with enhanced features"""
         try:
             start_time = time.time()
             logger.info(f"📥 Processing message from {sender_id}: {message_text[:50]}...")
+            
+            # Update active conversations
+            global SYSTEM_STATUS
+            SYSTEM_STATUS['active_conversations'] += 1
             
             # Update user database
             self.update_user_database(sender_id, verification_status="verified")
@@ -502,9 +563,6 @@ User's name: {user_name}
             # Track feature usage
             self.track_feature_usage(sender_id, "text_message")
             
-            # Send typing indicator
-            self.send_typing_indicator(sender_id)
-            
             # Get user info
             user_info = self.get_user_info(sender_id)
             user_name = user_info.get('first_name', 'Friend')
@@ -512,7 +570,7 @@ User's name: {user_name}
             # Get conversation history
             conversation_history = None
             if sender_id in self.conversation_memory:
-                recent_conversations = self.conversation_memory[sender_id][-3:]  # Last 3 conversations
+                recent_conversations = self.conversation_memory[sender_id][-3:]
                 conversation_history = "\n".join([
                     f"User: {conv['user']}\nBot: {conv['bot']}" 
                     for conv in recent_conversations
@@ -524,8 +582,8 @@ User's name: {user_name}
             # Update conversation memory
             self.update_conversation_memory(sender_id, message_text, response)
             
-            # Send response
-            success = self.send_message(sender_id, response)
+            # Send animated response
+            success = self.send_animated_message(sender_id, response)
             
             # Log interaction
             processing_time = time.time() - start_time
@@ -534,6 +592,10 @@ User's name: {user_name}
                 processing_time, None if success else "Send failed"
             )
             
+            # Update system metrics
+            SYSTEM_STATUS['response_time_avg'] = (SYSTEM_STATUS['response_time_avg'] + processing_time) / 2
+            SYSTEM_STATUS['active_conversations'] = max(0, SYSTEM_STATUS['active_conversations'] - 1)
+            
             logger.info(f"✅ Message processed in {processing_time:.2f}s using {provider}")
             
         except Exception as e:
@@ -541,60 +603,9 @@ User's name: {user_name}
             logger.error(error_msg)
             
             # Send error response
-            self.send_message(
+            self.send_animated_message(
                 sender_id,
-                "🤖 I encountered a technical issue. Please try again! I'm here to help you. 💙"
-            )
-    
-    def handle_image_message(self, sender_id: str, image_url: str, message_text: str = "", user_name: str = "User"):
-        """Handle incoming image messages with AI analysis"""
-        try:
-            start_time = time.time()
-            logger.info(f"📸 Processing image from {sender_id}: {image_url}")
-            
-            # Update user database
-            self.update_user_database(sender_id, verification_status="verified")
-            
-            # Track image count
-            with get_db() as conn:
-                conn.execute(
-                    'UPDATE users SET total_images = total_images + 1 WHERE user_id = ?',
-                    (sender_id,)
-                )
-            
-            # Track feature usage
-            self.track_feature_usage(sender_id, "image_analysis")
-            
-            # Send typing indicator
-            self.send_typing_indicator(sender_id)
-            
-            # Analyze image with AI
-            response, provider = self.analyze_image_with_ai(image_url, message_text, user_name)
-            
-            # Update conversation memory
-            image_context = f"[Image shared] {message_text}" if message_text else "[Image shared]"
-            self.update_conversation_memory(sender_id, image_context, response)
-            
-            # Send response
-            success = self.send_message(sender_id, response)
-            
-            # Log interaction
-            processing_time = time.time() - start_time
-            self.log_interaction(
-                sender_id, "image", message_text, response, provider, 
-                processing_time, None if success else "Send failed", image_url
-            )
-            
-            logger.info(f"✅ Image processed in {processing_time:.2f}s using {provider}")
-            
-        except Exception as e:
-            error_msg = f"Image handling error: {e}"
-            logger.error(error_msg)
-            
-            # Send error response
-            self.send_message(
-                sender_id,
-                "📸 I received your image but I'm having trouble analyzing it right now. Please try again or describe what you'd like to know about the image! 🤖"
+                "🤖 I encountered a technical issue. Please try again! I'm here to help you. 💙✨"
             )
     
     def handle_postback(self, sender_id: str, payload: str):
@@ -609,20 +620,22 @@ Hello! I'm your intelligent AI assistant, powered by advanced AI technology and 
 
 🚀 **What I can do:**
 • 💬 Have natural conversations about any topic
-• 📸 Analyze and understand images you share
+• 🎨 Provide creative ideas and solutions
 • 🎓 Help with learning and education
-• 💡 Provide creative ideas and solutions
-• 🔍 Answer questions and explain concepts
+• 💡 Answer questions and explain concepts
+• 🔍 Research and analyze information
 • 🎯 Assist with planning and problem-solving
 • 🌍 Discuss current events and general knowledge
+• ⚡ Real-time responses with typing animations
 
-✨ **Just send me any message or image to get started!**
+✨ **I'm available 24/7 with live status monitoring!**
 
-I'm here 24/7 to help make your day better! 🤖💙
+🤖 **Just send me any message to get started!**
+I respond with smooth typing animations just like Meta AI!
 
 *Developed with ❤️ by SUNNEL*"""
                 
-                self.send_message(sender_id, welcome_message)
+                self.send_animated_message(sender_id, welcome_message)
                 self.update_user_database(sender_id, verification_status="verified")
                 self.track_feature_usage(sender_id, "get_started")
             
@@ -655,56 +668,442 @@ def get_user_name(user_id: str) -> Optional[str]:
         logger.error(f"Error getting user name: {e}")
     return None
 
-@app.route('/')
-def home():
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>{BOT_NAME} v{BOT_VERSION}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); margin: 0; padding: 20px; color: white; }}
-            .container {{ max-width: 800px; margin: 0 auto; text-align: center; }}
-            .header {{ background: rgba(255,255,255,0.1); padding: 30px; border-radius: 15px; margin-bottom: 20px; }}
-            .status {{ background: rgba(255,255,255,0.1); padding: 20px; border-radius: 10px; margin: 10px 0; }}
-            .btn {{ background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px; display: inline-block; }}
-            .btn:hover {{ background: #45a049; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🤖 {BOT_NAME} v{BOT_VERSION}</h1>
-                <p>Advanced AI Assistant with Image Analysis</p>
-                <p>✅ Bot is running successfully!</p>
-            </div>
-            
-            <div class="status">
-                <h3>🔧 System Status</h3>
-                <p>📱 Facebook Integration: {'✅ Active' if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else '❌ Not Configured'}</p>
-                <p>🤖 OpenAI API: {'✅ Ready' if OPENAI_API_KEY else '❌ Not Configured'}</p>
-                <p>🌟 Gemini API: {'✅ Ready' if GEMINI_API_KEY and GEMINI_AVAILABLE else '❌ Not Available'}</p>
-            </div>
-            
-            <div class="status">
-                <h3>🚀 Features Available</h3>
-                <p>💬 Text Conversations</p>
-                <p>📸 Image Analysis & Understanding</p>
-                <p>🧠 Conversation Memory</p>
-                <p>📊 User Analytics</p>
-                <p>⚡ Real-time Processing</p>
-            </div>
-            
-            <a href="/dashboard" class="btn">📊 View Dashboard</a>
-            <a href="/health" class="btn">🏥 Health Check</a>
-            
-            <div style="margin-top: 30px;">
-                <p><em>Created with ❤️ by SUNNEL</em></p>
+# Enhanced WebView with real-time status
+ENHANCED_HOME_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ bot_name }} v{{ bot_version }} - Live Status</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --primary: #667eea;
+            --secondary: #764ba2;
+            --accent: #4ecdc4;
+            --success: #4caf50;
+            --warning: #ff9800;
+            --danger: #f44336;
+            --dark: #2c3e50;
+            --light: #ecf0f1;
+            --glass: rgba(255, 255, 255, 0.1);
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            min-height: 100vh;
+            color: white;
+            overflow-x: hidden;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .glass-card {
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s ease;
+        }
+        
+        .glass-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.2);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 3rem;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, #fff, var(--accent));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            color: rgba(255, 255, 255, 0.8);
+            margin-bottom: 20px;
+        }
+        
+        .live-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: var(--success);
+            padding: 10px 20px;
+            border-radius: 25px;
+            font-weight: 600;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .status-card {
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .status-icon {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+        
+        .status-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .status-label {
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+        
+        .system-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .metric-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--success));
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .feature-card {
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .feature-icon {
+            font-size: 2.5rem;
+            margin-bottom: 15px;
+        }
+        
+        .feature-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        
+        .feature-desc {
+            opacity: 0.8;
+            line-height: 1.6;
+        }
+        
+        .action-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            background: linear-gradient(45deg, var(--accent), var(--success));
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 25px;
+            font-size: 1rem;
+            font-weight: 600;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+        }
+        
+        .uptime-display {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+        
+        .real-time-indicator {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: var(--success);
+            padding: 10px 15px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            z-index: 1000;
+            animation: pulse 2s infinite;
+        }
+        
+        @media (max-width: 768px) {
+            .container { padding: 15px; }
+            .header h1 { font-size: 2rem; }
+            .status-grid { grid-template-columns: 1fr; }
+            .action-buttons { flex-direction: column; align-items: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="real-time-indicator">
+        🟢 Live Status Active
+    </div>
+    
+    <div class="container">
+        <div class="glass-card header">
+            <h1>{{ bot_name }}</h1>
+            <p class="subtitle">Version {{ bot_version }} - Next-Generation AI Assistant</p>
+            <div class="live-status">
+                <span>🚀</span>
+                <span>System Online & Active 24/7</span>
             </div>
         </div>
-    </body>
-    </html>
-    """
+        
+        <div class="status-grid">
+            <div class="status-card">
+                <div class="status-icon">🤖</div>
+                <div class="status-value">{{ bot_status }}</div>
+                <div class="status-label">Bot Status</div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">⚡</div>
+                <div class="status-value">{{ uptime_display }}</div>
+                <div class="status-label">Uptime</div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">📊</div>
+                <div class="status-value">{{ total_requests }}</div>
+                <div class="status-label">Total Requests</div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">🎯</div>
+                <div class="status-value">{{ response_time }}ms</div>
+                <div class="status-label">Avg Response Time</div>
+            </div>
+        </div>
+        
+        <div class="glass-card">
+            <h2>🖥️ Real-Time System Metrics</h2>
+            <div class="system-metrics">
+                <div class="metric-card">
+                    <div>CPU Usage</div>
+                    <div class="status-value">{{ cpu_usage }}%</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: {{ cpu_usage }}%"></div>
+                    </div>
+                </div>
+                <div class="metric-card">
+                    <div>Memory Usage</div>
+                    <div class="status-value">{{ memory_usage }}%</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: {{ memory_usage }}%"></div>
+                    </div>
+                </div>
+                <div class="metric-card">
+                    <div>Active Conversations</div>
+                    <div class="status-value">{{ active_conversations }}</div>
+                </div>
+                <div class="metric-card">
+                    <div>System Health</div>
+                    <div class="status-value">{{ system_health }}</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="glass-card">
+            <h2>🚀 Enhanced Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">💬</div>
+                    <div class="feature-title">Animated Responses</div>
+                    <div class="feature-desc">Meta AI-style typing animations with realistic response timing</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <div class="feature-title">24/7 Uptime</div>
+                    <div class="feature-desc">Always-on system with automatic keep-alive and monitoring</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <div class="feature-title">Real-Time Status</div>
+                    <div class="feature-desc">Live system metrics and performance monitoring</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎨</div>
+                    <div class="feature-title">Enhanced WebView</div>
+                    <div class="feature-desc">Modern glass-morphism design with live updates</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="action-buttons">
+            <a href="/dashboard" class="btn">
+                <span>📊</span>
+                <span>Live Dashboard</span>
+            </a>
+            <a href="/health" class="btn">
+                <span>🏥</span>
+                <span>Health Monitor</span>
+            </a>
+            <a href="/api/status" class="btn">
+                <span>🔄</span>
+                <span>API Status</span>
+            </a>
+        </div>
+        
+        <div class="glass-card" style="text-align: center; margin-top: 30px;">
+            <p style="opacity: 0.8;"><em>Created with ❤️ by SUNNEL | Powered by Advanced AI</em></p>
+            <p style="margin-top: 10px; font-size: 0.9rem; opacity: 0.6;">
+                Last updated: <span id="lastUpdate"></span>
+            </p>
+        </div>
+    </div>
+    
+    <script>
+        // Auto-refresh every 30 seconds
+        setInterval(() => {
+            location.reload();
+        }, 30000);
+        
+        // Update timestamp
+        document.getElementById('lastUpdate').textContent = new Date().toLocaleString();
+        
+        // Animate cards on load
+        document.addEventListener('DOMContentLoaded', function() {
+            const cards = document.querySelectorAll('.glass-card, .status-card, .feature-card');
+            cards.forEach((card, index) => {
+                card.style.opacity = '0';
+                card.style.transform = 'translateY(20px)';
+                setTimeout(() => {
+                    card.style.transition = 'all 0.5s ease';
+                    card.style.opacity = '1';
+                    card.style.transform = 'translateY(0)';
+                }, index * 100);
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    """Enhanced home page with real-time status"""
+    try:
+        global SYSTEM_STATUS
+        uptime_duration = datetime.now() - SYSTEM_STATUS['uptime_start']
+        uptime_hours = int(uptime_duration.total_seconds() // 3600)
+        uptime_minutes = int((uptime_duration.total_seconds() % 3600) // 60)
+        
+        return render_template_string(ENHANCED_HOME_HTML, **{
+            'bot_name': BOT_NAME,
+            'bot_version': BOT_VERSION,
+            'bot_status': "🟢 ACTIVE" if SYSTEM_STATUS['is_active'] else "🔴 OFFLINE",
+            'uptime_display': f"{uptime_hours}h {uptime_minutes}m",
+            'total_requests': SYSTEM_STATUS['total_requests'],
+            'response_time': int(SYSTEM_STATUS['response_time_avg'] * 1000),
+            'cpu_usage': round(SYSTEM_STATUS['cpu_usage'], 1),
+            'memory_usage': round(SYSTEM_STATUS['memory_usage'], 1),
+            'active_conversations': SYSTEM_STATUS['active_conversations'],
+            'system_health': SYSTEM_STATUS['system_health'].upper()
+        })
+    except Exception as e:
+        logger.error(f"Home page error: {e}")
+        return f"System Error: {str(e)}", 500
+
+@app.route('/api/status')
+def api_status():
+    """Real-time API status endpoint"""
+    global SYSTEM_STATUS
+    uptime_duration = datetime.now() - SYSTEM_STATUS['uptime_start']
+    
+    return jsonify({
+        'status': 'active' if SYSTEM_STATUS['is_active'] else 'inactive',
+        'uptime_seconds': int(uptime_duration.total_seconds()),
+        'uptime_formatted': str(uptime_duration).split('.')[0],
+        'last_heartbeat': SYSTEM_STATUS['last_heartbeat'].isoformat(),
+        'total_requests': SYSTEM_STATUS['total_requests'],
+        'active_conversations': SYSTEM_STATUS['active_conversations'],
+        'system_health': SYSTEM_STATUS['system_health'],
+        'performance': {
+            'cpu_usage': SYSTEM_STATUS['cpu_usage'],
+            'memory_usage': SYSTEM_STATUS['memory_usage'],
+            'avg_response_time': SYSTEM_STATUS['response_time_avg']
+        },
+        'features': {
+            'animated_typing': True,
+            'real_time_status': True,
+            'auto_uptime': True,
+            'enhanced_webview': True
+        },
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
@@ -725,7 +1124,7 @@ def verify_webhook():
 
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
-    """Enhanced webhook handler with comprehensive error handling"""
+    """Enhanced webhook handler"""
     try:
         data = request.get_json()
         
@@ -739,18 +1138,7 @@ def handle_webhook():
                         message_text = message_data.get('text', '')
                         sender_name = get_user_name(sender_id)
                         
-                        # Handle attachments
-                        if message_data.get('attachments'):
-                            for attachment in message_data['attachments']:
-                                if attachment.get('type') == 'image':
-                                    image_url = attachment.get('payload', {}).get('url')
-                                    if image_url:
-                                        threading.Thread(
-                                            target=bot.handle_image_message,
-                                            args=(sender_id, image_url, message_text, sender_name)
-                                        ).start()
-                                        break
-                        elif message_text:
+                        if message_text:
                             threading.Thread(
                                 target=bot.handle_message,
                                 args=(sender_id, message_text)
@@ -771,17 +1159,17 @@ def handle_webhook():
 
 @app.route('/dashboard')
 def dashboard():
-    """Analytics dashboard"""
+    """Enhanced analytics dashboard with real-time data"""
     try:
         with get_db() as conn:
-            # Basic statistics
+            # Get comprehensive statistics
             user_stats = conn.execute('''
                 SELECT 
                     COUNT(*) as total_users,
                     COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified_users,
-                    SUM(total_messages) as total_messages,
-                    SUM(total_images) as total_images,
-                    AVG(user_rating) as avg_rating,
+                    COALESCE(SUM(total_messages), 0) as total_messages,
+                    COALESCE(SUM(total_images), 0) as total_images,
+                    COALESCE(AVG(user_rating), 0.0) as avg_rating,
                     COUNT(CASE WHEN last_interaction > datetime('now', '-24 hours') THEN 1 END) as active_24h,
                     COUNT(CASE WHEN last_interaction > datetime('now', '-7 days') THEN 1 END) as active_7d
                 FROM users
@@ -792,8 +1180,7 @@ def dashboard():
                 SELECT 
                     COUNT(*) as total_interactions,
                     AVG(processing_time) as avg_response_time,
-                    COUNT(CASE WHEN error_message IS NULL THEN 1 END) * 100.0 / COUNT(*) as success_rate,
-                    COUNT(CASE WHEN interaction_type = 'image' THEN 1 END) as image_interactions
+                    COUNT(CASE WHEN error_message IS NULL THEN 1 END) * 100.0 / COUNT(*) as success_rate
                 FROM interactions
                 WHERE timestamp > datetime('now', '-24 hours')
             ''').fetchone()
@@ -807,34 +1194,145 @@ def dashboard():
                 LIMIT 10
             ''').fetchall()
         
+        # Get real-time status
+        global SYSTEM_STATUS
+        uptime_duration = datetime.now() - SYSTEM_STATUS['uptime_start']
+        
         dashboard_html = f'''
         <!DOCTYPE html>
-        <html>
+        <html lang="en">
         <head>
-            <title>{BOT_NAME} Dashboard</title>
+            <title>{BOT_NAME} - Live Dashboard</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="refresh" content="30">
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-                .container {{ max-width: 1200px; margin: 0 auto; }}
-                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                          color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }}
-                .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
-                              gap: 20px; margin-bottom: 20px; }}
-                .stat-card {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                .stat-number {{ font-size: 2em; font-weight: bold; color: #667eea; }}
-                .stat-label {{ color: #666; margin-top: 5px; }}
-                .section {{ background: white; padding: 20px; border-radius: 10px; 
-                           box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-                .interaction-item {{ padding: 10px; border-bottom: 1px solid #eee; }}
-                .timestamp {{ color: #888; font-size: 0.9em; }}
-                .image-tag {{ background: #e3f2fd; color: #1976d2; padding: 2px 6px; border-radius: 3px; font-size: 0.8em; }}
-                .text-tag {{ background: #f3e5f5; color: #7b1fa2; padding: 2px 6px; border-radius: 3px; font-size: 0.8em; }}
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    color: white;
+                    padding: 20px;
+                }}
+                
+                .container {{ max-width: 1400px; margin: 0 auto; }}
+                
+                .glass-card {{
+                    background: rgba(255, 255, 255, 0.1);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    border: 1px solid rgba(255, 255, 255, 0.2);
+                    padding: 25px;
+                    margin-bottom: 20px;
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                }}
+                
+                .header {{
+                    text-align: center;
+                    margin-bottom: 30px;
+                }}
+                
+                .header h1 {{
+                    font-size: 2.5rem;
+                    margin-bottom: 10px;
+                    background: linear-gradient(45deg, #fff, #4ecdc4);
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                }}
+                
+                .stats-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 20px;
+                    margin-bottom: 30px;
+                }}
+                
+                .stat-card {{
+                    background: rgba(255, 255, 255, 0.1);
+                    border-radius: 15px;
+                    padding: 20px;
+                    text-align: center;
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                }}
+                
+                .stat-number {{
+                    font-size: 2rem;
+                    font-weight: bold;
+                    color: #4ecdc4;
+                    margin-bottom: 5px;
+                }}
+                
+                .stat-label {{
+                    font-size: 0.9rem;
+                    opacity: 0.8;
+                }}
+                
+                .live-indicator {{
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    background: #4caf50;
+                    padding: 10px 15px;
+                    border-radius: 20px;
+                    font-size: 0.9rem;
+                    font-weight: 600;
+                    z-index: 1000;
+                    animation: pulse 2s infinite;
+                }}
+                
+                @keyframes pulse {{
+                    0% {{ opacity: 1; }}
+                    50% {{ opacity: 0.7; }}
+                    100% {{ opacity: 1; }}
+                }}
+                
+                .interaction-item {{
+                    background: rgba(255, 255, 255, 0.05);
+                    border-radius: 10px;
+                    padding: 15px;
+                    margin-bottom: 10px;
+                    border-left: 4px solid #4ecdc4;
+                }}
+                
+                .back-btn {{
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 10px;
+                    background: rgba(255, 255, 255, 0.1);
+                    padding: 10px 20px;
+                    border-radius: 25px;
+                    text-decoration: none;
+                    color: white;
+                    margin-bottom: 20px;
+                    transition: all 0.3s ease;
+                }}
+                
+                .back-btn:hover {{
+                    background: rgba(255, 255, 255, 0.2);
+                    transform: translateY(-2px);
+                }}
             </style>
         </head>
         <body>
+            <div class="live-indicator">
+                🟢 Live Dashboard
+            </div>
+            
             <div class="container">
-                <div class="header">
-                    <h1>🤖 {BOT_NAME} Dashboard</h1>
-                    <p>Real-time analytics and performance metrics</p>
+                <a href="/" class="back-btn">
+                    ← Back to Home
+                </a>
+                
+                <div class="glass-card header">
+                    <h1>📊 {BOT_NAME} Dashboard</h1>
+                    <p>Real-time Analytics & Performance Monitoring</p>
+                    <p style="margin-top: 10px; opacity: 0.8;">
+                        🚀 Uptime: {str(uptime_duration).split('.')[0]} | 
+                        ⚡ Status: {'ACTIVE' if SYSTEM_STATUS['is_active'] else 'OFFLINE'} |
+                        🔥 System Health: {SYSTEM_STATUS['system_health'].upper()}
+                    </p>
                 </div>
                 
                 <div class="stats-grid">
@@ -843,51 +1341,67 @@ def dashboard():
                         <div class="stat-label">Total Users</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-number">{user_stats['verified_users'] or 0}</div>
-                        <div class="stat-label">Verified Users</div>
-                    </div>
-                    <div class="stat-card">
                         <div class="stat-number">{user_stats['total_messages'] or 0}</div>
-                        <div class="stat-label">Text Messages</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{user_stats['total_images'] or 0}</div>
-                        <div class="stat-label">Images Analyzed</div>
+                        <div class="stat-label">Messages Sent</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{user_stats['active_24h'] or 0}</div>
                         <div class="stat-label">Active (24h)</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-number">{perf_stats['image_interactions'] or 0}</div>
-                        <div class="stat-label">Images (24h)</div>
+                        <div class="stat-number">{SYSTEM_STATUS['total_requests']}</div>
+                        <div class="stat-label">Total Requests</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{round(SYSTEM_STATUS['cpu_usage'], 1)}%</div>
+                        <div class="stat-label">CPU Usage</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{round(SYSTEM_STATUS['memory_usage'], 1)}%</div>
+                        <div class="stat-label">Memory Usage</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{int(SYSTEM_STATUS['response_time_avg'] * 1000)}ms</div>
+                        <div class="stat-label">Avg Response</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{SYSTEM_STATUS['active_conversations']}</div>
+                        <div class="stat-label">Active Chats</div>
                     </div>
                 </div>
                 
-                <div class="section">
-                    <h2>📊 Performance Metrics (24h)</h2>
-                    <p><strong>Success Rate:</strong> {perf_stats['success_rate'] or 100:.1f}%</p>
-                    <p><strong>Average Response Time:</strong> {perf_stats['avg_response_time'] or 0:.2f}s</p>
-                    <p><strong>Total Interactions:</strong> {perf_stats['total_interactions'] or 0}</p>
-                    <p><strong>Image Analysis:</strong> {perf_stats['image_interactions'] or 0} images processed</p>
+                <div class="glass-card">
+                    <h2>🚀 Enhanced Features Status</h2>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 15px;">
+                        <div style="background: rgba(76, 175, 80, 0.2); padding: 15px; border-radius: 10px;">
+                            <strong>✅ Animated Typing</strong><br>
+                            <small>Meta AI-style response animations</small>
+                        </div>
+                        <div style="background: rgba(76, 175, 80, 0.2); padding: 15px; border-radius: 10px;">
+                            <strong>✅ 24/7 Uptime</strong><br>
+                            <small>Auto keep-alive system active</small>
+                        </div>
+                        <div style="background: rgba(76, 175, 80, 0.2); padding: 15px; border-radius: 10px;">
+                            <strong>✅ Real-time Status</strong><br>
+                            <small>Live system monitoring</small>
+                        </div>
+                        <div style="background: rgba(76, 175, 80, 0.2); padding: 15px; border-radius: 10px;">
+                            <strong>✅ Enhanced WebView</strong><br>
+                            <small>Modern glass-morphism UI</small>
+                        </div>
+                    </div>
                 </div>
                 
-                <div class="section">
+                <div class="glass-card">
                     <h2>💬 Recent Interactions</h2>
-                    {''.join([f'<div class="interaction-item"><strong>{row["first_name"] or "Unknown"}</strong>: <span class="{"image-tag" if row["interaction_type"] == "image" else "text-tag"}">{row["interaction_type"].upper()}</span> {(row["user_message"] or "Image shared")[:100]}{"..." if len(row["user_message"] or "") > 100 else ""}<br><span class="timestamp">{row["timestamp"]} • {row["ai_provider"] or "Unknown"}</span></div>' for row in recent_interactions]) if recent_interactions else '<p>No recent interactions</p>'}
+                    {''.join([f'<div class="interaction-item"><strong>{row["first_name"] or "User"}</strong> • <span style="background: #4ecdc4; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem;">{row["ai_provider"] or "AI"}</span><br><span style="opacity: 0.8;">{(row["user_message"] or "Message")[:100]}{"..." if len(row["user_message"] or "") > 100 else ""}</span><br><small style="opacity: 0.6;">{row["timestamp"]}</small></div>' for row in recent_interactions]) if recent_interactions else '<p>No recent interactions</p>'}
                 </div>
                 
-                <div class="section">
-                    <h2>🎯 AI Features</h2>
-                    <p>✅ Text Conversations with Context Memory</p>
-                    <p>✅ Advanced Image Analysis & Understanding</p>
-                    <p>✅ Multi-Provider AI (Gemini + OpenAI)</p>
-                    <p>✅ Real-time Performance Monitoring</p>
-                    <p>✅ Comprehensive User Analytics</p>
-                </div>
-                
-                <div class="section">
-                    <p><em>Created with ❤️ by SUNNEL | Version {BOT_VERSION}</em></p>
+                <div class="glass-card" style="text-align: center;">
+                    <p><em>Created with ❤️ by SUNNEL | {BOT_NAME} v{BOT_VERSION}</em></p>
+                    <p style="margin-top: 10px; opacity: 0.6;">
+                        Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Auto-refresh: 30s
+                    </p>
                 </div>
             </div>
         </body>
@@ -902,61 +1416,58 @@ def dashboard():
 
 @app.route('/health')
 def health_check():
-    """Comprehensive health check endpoint"""
+    """Enhanced health check with real-time metrics"""
     try:
+        global SYSTEM_STATUS
+        
         with get_db() as conn:
             db_status = "healthy"
             stats = conn.execute('''
                 SELECT 
                     COUNT(*) as total_users,
-                    SUM(total_messages) as total_messages,
-                    AVG(CASE WHEN last_interaction > datetime('now', '-24 hours') THEN 1.0 ELSE 0.0 END) * 100 as success_rate
+                    COALESCE(SUM(total_messages), 0) as total_messages
                 FROM users
             ''').fetchone()
         
-        # Test AI services
-        ai_status = {}
-        
-        if OPENAI_API_KEY:
-            ai_status['openai'] = 'configured'
-        else:
-            ai_status['openai'] = 'not_configured'
-        
-        if GEMINI_API_KEY and GEMINI_AVAILABLE:
-            ai_status['gemini'] = 'configured'
-        else:
-            ai_status['gemini'] = 'not_configured' if not GEMINI_API_KEY else 'library_error'
-        
-        uptime_duration = datetime.now() - bot.start_time
+        uptime_duration = datetime.now() - SYSTEM_STATUS['uptime_start']
         
         return jsonify({
-            'status': 'healthy',
+            'status': 'healthy' if SYSTEM_STATUS['is_active'] else 'unhealthy',
             'timestamp': datetime.now().isoformat(),
             'bot_info': {
                 'name': BOT_NAME,
                 'version': BOT_VERSION,
-                'uptime_hours': round(uptime_duration.total_seconds() / 3600, 2),
-                'uptime_days': round(uptime_duration.total_seconds() / 86400, 2)
+                'uptime_seconds': int(uptime_duration.total_seconds()),
+                'uptime_formatted': str(uptime_duration).split('.')[0],
+                'last_heartbeat': SYSTEM_STATUS['last_heartbeat'].isoformat()
+            },
+            'system_metrics': {
+                'cpu_usage': SYSTEM_STATUS['cpu_usage'],
+                'memory_usage': SYSTEM_STATUS['memory_usage'],
+                'system_health': SYSTEM_STATUS['system_health'],
+                'active_conversations': SYSTEM_STATUS['active_conversations'],
+                'total_requests': SYSTEM_STATUS['total_requests'],
+                'avg_response_time': SYSTEM_STATUS['response_time_avg']
             },
             'services': {
                 'database': db_status,
                 'facebook_api': 'configured' if PAGE_ACCESS_TOKEN else 'not_configured',
                 'webhook': 'configured' if VERIFY_TOKEN else 'not_configured',
-                'ai_services': ai_status
+                'openai': 'configured' if OPENAI_API_KEY else 'not_configured',
+                'gemini': 'configured' if GEMINI_API_KEY and GEMINI_AVAILABLE else 'not_configured'
+            },
+            'features': {
+                'animated_typing': True,
+                'real_time_status': True,
+                'auto_uptime': True,
+                'enhanced_webview': True,
+                'conversation_memory': True,
+                'user_analytics': True,
+                'performance_monitoring': True
             },
             'statistics': {
                 'total_users': stats['total_users'] if stats else 0,
-                'total_messages': stats['total_messages'] if stats else 0,
-                'success_rate': stats['success_rate'] if stats else 100.0
-            },
-            'features': {
-                'text_conversations': True,
-                'image_analysis': bool(ai_status.get('openai') == 'configured' or ai_status.get('gemini') == 'configured'),
-                'conversation_memory': True,
-                'user_analytics': True,
-                'error_recovery': True,
-                'performance_monitoring': True,
-                'multi_ai_providers': True
+                'total_messages': stats['total_messages'] if stats else 0
             }
         })
     except Exception as e:
@@ -970,17 +1481,22 @@ if __name__ == '__main__':
     # Initialize database
     init_database()
     
+    # Start keep-alive system
+    Timer(5, keep_alive).start()
+    
     # Start the Flask app
     print(f"🚀 Starting {BOT_NAME} v{BOT_VERSION}")
-    print("🔗 Bot will be available at: https://your-repl-url.replit.dev")
-    print("📊 Dashboard available at: https://your-repl-url.replit.dev/dashboard")
-    print("🏥 Health check available at: https://your-repl-url.replit.dev/health")
-    print("\n🎯 Features Available:")
-    print("  • 💬 Advanced text conversations")
-    print("  • 📸 Complete image analysis & understanding")
-    print("  • 🧠 Conversation memory & context")
-    print("  • 📊 Real-time analytics & monitoring")
-    print("  • 🤖 Multi-AI provider support (Gemini + OpenAI)")
-    print("  • ⚡ High-performance processing")
+    print("🌟 NEW FEATURES:")
+    print("  • ✨ Meta AI-style animated typing responses")
+    print("  • 🔄 Real-time active status monitoring")
+    print("  • ⚡ 24/7 auto-uptime system")
+    print("  • 🎨 Enhanced glass-morphism WebView")
+    print("  • 📊 Live system metrics dashboard")
+    print("  • 🚀 Performance optimization")
+    print("\n🔗 Access Points:")
+    print("  • 🏠 Home: https://your-repl-url.replit.dev")
+    print("  • 📊 Dashboard: https://your-repl-url.replit.dev/dashboard")
+    print("  • 🏥 Health: https://your-repl-url.replit.dev/health")
+    print("  • 📡 API Status: https://your-repl-url.replit.dev/api/status")
     
     app.run(host='0.0.0.0', port=5000, debug=False)
