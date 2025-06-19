@@ -246,6 +246,8 @@ You now have full access to our Ultimate AI Bot! 🚀
 
 **Thank you for following and supporting us!** 
 
+by developer SUNNEL 🤍
+
 You can now ask me anything or send images for analysis! 🍓🥰"""
 
         # Send the congratulations message first
