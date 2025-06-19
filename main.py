@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Configuration - you'll need to set these in Secrets
-VERIFY_TOKEN = os.getenv('FACEBOOK_VERIFY_TOKEN', '@facebookbot')
+VERIFY_TOKEN = os.getenv('FACEBOOK_VERIFY_TOKEN', 'your_verify_token_here')
 PAGE_ACCESS_TOKEN = os.getenv('FACEBOOK_PAGE_ACCESS_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -650,28 +650,13 @@ Current user: {user_name}
         return None
     
     def handle_message(self, sender_id, message_text, sender_name=None):
-        """Process incoming message with security verification"""
+        """Process incoming message with open access"""
         logger.info(f"Processing message from {sender_id}: {message_text}")
         
-        # Update user in database
-        self.update_user_database(sender_id)
+        # Update user in database with verified status
+        self.update_user_database(sender_id, verification_status="verified")
         
-        # Check user verification status
-        is_verified, status = self.verify_user_access(sender_id)
-        
-        if not is_verified:
-            self.send_verification_request(sender_id, status)
-            self.log_user_interaction(sender_id, "unverified_attempt", message_text)
-            return
-        
-        # If newly verified, send congratulations
-        if status == "newly_verified":
-            self.update_user_database(sender_id, verification_status="verified")
-            self.send_congratulations_with_image(sender_id)
-            self.log_user_interaction(sender_id, "verification_complete", "User verified successfully")
-            return
-        
-        # User is verified, proceed with normal AI response
+        # Send typing indicator and process AI response
         self.send_typing_indicator(sender_id)
         context = self.get_conversation_context(sender_id)
         response, provider = self.get_smart_ai_response(message_text, sender_name, context)
@@ -682,28 +667,13 @@ Current user: {user_name}
         self.log_user_interaction(sender_id, "message", message_text, provider)
     
     def handle_image_message(self, sender_id, attachment_url, message_text="", sender_name=None):
-        """Handle image messages with security verification"""
+        """Handle image messages with open access"""
         logger.info(f"Processing image from {sender_id}")
         
-        # Update user in database
-        self.update_user_database(sender_id)
+        # Update user in database with verified status
+        self.update_user_database(sender_id, verification_status="verified")
         
-        # Check user verification status
-        is_verified, status = self.verify_user_access(sender_id)
-        
-        if not is_verified:
-            self.send_verification_request(sender_id, status)
-            self.log_user_interaction(sender_id, "unverified_image_attempt", message_text)
-            return
-        
-        # If newly verified, send congratulations
-        if status == "newly_verified":
-            self.update_user_database(sender_id, verification_status="verified")
-            self.send_congratulations_with_image(sender_id)
-            self.log_user_interaction(sender_id, "verification_complete", "User verified successfully")
-            return
-        
-        # User is verified, proceed with image analysis
+        # Process image analysis directly
         self.send_typing_indicator(sender_id)
         
         image_data = self.download_image(attachment_url)
@@ -788,24 +758,21 @@ def handle_webhook():
                     elif messaging_event.get('postback'):
                         payload = messaging_event['postback'].get('payload')
                         if payload == 'GET_STARTED':
-                            # Check verification status for get started
-                            bot.update_user_database(sender_id)
-                            is_verified, status = bot.verify_user_access(sender_id)
-                            if not is_verified:
-                                bot.send_verification_request(sender_id, status)
-                            elif status == "newly_verified":
-                                bot.update_user_database(sender_id, verification_status="verified")
-                                bot.send_congratulations_with_image(sender_id)
-                            else:
-                                welcome_message = """🌟 **Welcome Back!** 🚀
+                            # Send welcome message to all users
+                            bot.update_user_database(sender_id, verification_status="verified")
+                            welcome_message = """🌟 **Welcome to Ultimate AI Assistant!** 🚀
 
-You're already verified! I'm your Ultimate AI Assistant powered by:
+I'm your powerful AI bot featuring:
 🤖 ChatGPT for intelligent conversations
 🌟 Google Gemini for creative tasks
 🔍 Advanced image analysis capabilities
+💭 Smart conversation memory
+⚡ Instant 24/7 responses
 
-Just send me any message or image, and I'll help you! 🍓🥰"""
-                                bot.send_message(sender_id, welcome_message)
+Just send me any message or image, and I'll help you! 🍓🥰
+
+Developed by SUNNEL 🤍"""
+                            bot.send_message(sender_id, welcome_message)
         
         return 'OK', 200
         
@@ -1130,9 +1097,9 @@ HOME_HTML = """
             🔄 Auto Uptime: {{ uptime_hours }} hours | 🎯 Monitoring Active
         </div>
         
-        <div class="security-banner">
-            🔐 SECURED ACCESS SYSTEM ACTIVE 🔐<br>
-            Users must follow page & like specific post (ID: {{ required_post_id }})
+        <div style="background: linear-gradient(45deg, #4ecdc4, #44a08d); padding: 20px; border-radius: 15px; text-align: center; margin: 20px 0; color: white; font-weight: bold;">
+            🌟 OPEN ACCESS - ALL USERS WELCOME! 🌟<br>
+            No verification required - Start chatting immediately!
         </div>
         
         <div class="stats-grid">
@@ -1182,9 +1149,9 @@ HOME_HTML = """
         
         <h2 style="text-align: center; margin: 30px 0;">🌟 Enhanced Features</h2>
         <div class="features">
-            <div class="feature security-feature">
-                <strong>🔐 Advanced Security</strong><br>
-                Specific post verification system with auto-tracking
+            <div class="feature">
+                <strong>🌟 Open Access</strong><br>
+                Welcome to all users - no verification required
             </div>
             <div class="feature">
                 <strong>📊 Real-time Analytics</strong><br>
@@ -1438,7 +1405,7 @@ DASHBOARD_HTML = """
         <div class="header">
             <h1>📊 Bot Analytics Dashboard</h1>
             <p>Real-time monitoring and user analytics</p>
-            <p><strong>Uptime:</strong> {{ uptime_hours }} hours | <strong>Required Post:</strong> {{ required_post_id }}</p>
+            <p><strong>Uptime:</strong> {{ uptime_hours }} hours | <strong>Access:</strong> Open to All Users 🌟</p>
         </div>
         
         <div class="stats-grid">
