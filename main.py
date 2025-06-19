@@ -4,7 +4,6 @@ import json
 import requests
 from flask import Flask, request, jsonify
 import openai
-import google.generativeai as genai
 from datetime import datetime
 import logging
 import base64
@@ -12,6 +11,15 @@ import io
 from PIL import Image
 import time
 import random
+
+# Only import Gemini if available (fix for grpc error)
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"Gemini not available: {e}")
+    GEMINI_AVAILABLE = False
+    genai = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,15 +37,17 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and GEMINI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
 
 class EnhancedFacebookBot:
     def __init__(self):
         self.api_version = 'v18.0'
         self.base_url = f'https://graph.facebook.com/{self.api_version}'
-        self.conversation_memory = {}  # Store conversation context
-        self.user_preferences = {}     # Store user preferences
+        self.conversation_memory = {}
+        self.user_preferences = {}
+        self.verified_users = set()  # Store verified users
+        self.user_states = {}  # Track user verification state
         
     def send_message(self, recipient_id, message_text):
         """Send a message to a Facebook user"""
@@ -58,6 +68,39 @@ class EnhancedFacebookBot:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send message: {e}")
             return False
+
+    def send_image_message(self, recipient_id, image_url, message_text=None):
+        """Send an image message to a Facebook user"""
+        url = f'{self.base_url}/me/messages'
+        headers = {'Content-Type': 'application/json'}
+        
+        message_data = {
+            'attachment': {
+                'type': 'image',
+                'payload': {
+                    'url': image_url,
+                    'is_reusable': True
+                }
+            }
+        }
+        
+        if message_text:
+            message_data['text'] = message_text
+        
+        data = {
+            'recipient': {'id': recipient_id},
+            'message': message_data,
+            'access_token': PAGE_ACCESS_TOKEN
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            logger.info(f"Image message sent successfully to {recipient_id}")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to send image message: {e}")
+            return False
     
     def send_typing_indicator(self, recipient_id):
         """Send typing indicator to show bot is processing"""
@@ -74,6 +117,145 @@ class EnhancedFacebookBot:
             requests.post(url, headers=headers, json=data)
         except:
             pass
+
+    def check_user_follows_page(self, user_id):
+        """Check if user follows the page"""
+        try:
+            url = f'{self.base_url}/{user_id}'
+            params = {
+                'fields': 'subscribed_field',
+                'access_token': PAGE_ACCESS_TOKEN
+            }
+            response = requests.get(url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('subscribed_field', False)
+        except Exception as e:
+            logger.error(f"Error checking follow status: {e}")
+        return False
+
+    def check_user_liked_recent_posts(self, user_id):
+        """Check if user liked recent posts (simplified check)"""
+        try:
+            # Get recent posts from the page
+            url = f'{self.base_url}/me/posts'
+            params = {
+                'fields': 'id,likes.summary(true)',
+                'limit': 5,
+                'access_token': PAGE_ACCESS_TOKEN
+            }
+            response = requests.get(url, params=params)
+            
+            if response.status_code == 200:
+                posts_data = response.json()
+                posts = posts_data.get('data', [])
+                
+                for post in posts:
+                    # Check if user liked this post
+                    post_id = post.get('id')
+                    likes_url = f'{self.base_url}/{post_id}/likes/{user_id}'
+                    like_params = {'access_token': PAGE_ACCESS_TOKEN}
+                    
+                    like_response = requests.get(likes_url, params=like_params)
+                    if like_response.status_code == 200:
+                        like_data = like_response.json()
+                        if like_data.get('data'):
+                            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking like status: {e}")
+        
+        return False
+
+    def verify_user_access(self, user_id):
+        """Verify if user has followed page and liked posts"""
+        if user_id in self.verified_users:
+            return True, "verified"
+        
+        # Check follow status
+        follows_page = self.check_user_follows_page(user_id)
+        
+        # Check like status  
+        liked_posts = self.check_user_liked_recent_posts(user_id)
+        
+        if follows_page and liked_posts:
+            self.verified_users.add(user_id)
+            return True, "newly_verified"
+        elif follows_page and not liked_posts:
+            return False, "need_like"
+        elif not follows_page and liked_posts:
+            return False, "need_follow"
+        else:
+            return False, "need_both"
+
+    def send_verification_request(self, user_id, status):
+        """Send verification request message based on status"""
+        if status == "need_both":
+            message = """🔐 **Welcome! Access Required** 🔐
+
+To unlock full access to this amazing AI bot, please:
+
+1️⃣ **Follow this page** 👍
+2️⃣ **Like our recent posts** ❤️
+
+Once you complete both steps, you'll get full access to:
+🤖 Advanced AI conversations (ChatGPT + Gemini)
+🔍 Image analysis capabilities  
+💭 Smart conversation memory
+⚡ Instant responses 24/7
+
+Please complete these steps and send any message to verify! 🚀"""
+
+        elif status == "need_follow":
+            message = """🔐 **Almost There!** 🔐
+
+Thank you for liking our posts! ❤️
+
+To complete verification, please:
+1️⃣ **Follow this page** 👍
+
+Once you follow, you'll have full access to all AI features! 🚀"""
+
+        elif status == "need_like":
+            message = """🔐 **Almost There!** 🔐
+
+Thank you for following our page! 👍
+
+To complete verification, please:
+2️⃣ **Like our recent posts** ❤️
+
+Once you like our posts, you'll have full access to all AI features! 🚀"""
+
+        self.send_message(user_id, message)
+
+    def send_congratulations_with_image(self, user_id):
+        """Send congratulations message with the custom image"""
+        congrats_message = """🎉 **CONGRATULATIONS!** 🎉
+
+✅ **Verification Complete!** ✅
+
+You now have full access to our Ultimate AI Bot! 🚀
+
+🌟 **Available Features:**
+🤖 ChatGPT & Gemini AI conversations
+🔍 Advanced image analysis
+💭 Smart conversation memory
+⚡ Instant 24/7 responses
+🎨 Creative AI assistance
+
+**Thank you for following and supporting us!** 
+
+You can now ask me anything or send images for analysis! 🍓🥰"""
+
+        # Send the congratulations message first
+        self.send_message(user_id, congrats_message)
+        
+        # Send the custom image (you'll need to host this image publicly)
+        # For now, I'll use a placeholder - you should upload your image to a public URL
+        image_url = "https://i.imgur.com/YourImageHere.png"  # Replace with your hosted image URL
+        
+        self.send_image_message(user_id, image_url, "🌟 Developed by SUNNEL - Thank you for using our AI bot! 🌟")
     
     def download_image(self, attachment_url):
         """Download image from Facebook attachment URL"""
@@ -87,17 +269,13 @@ class EnhancedFacebookBot:
     
     def analyze_image_with_gemini(self, image_data, user_question="What's in this image?"):
         """Analyze image using Google Gemini Vision"""
-        if not GEMINI_API_KEY:
+        if not GEMINI_API_KEY or not GEMINI_AVAILABLE:
             return None
             
         try:
-            # Convert image data to PIL Image
             image = Image.open(io.BytesIO(image_data))
-            
-            # Initialize Gemini model
             model = genai.GenerativeModel('gemini-1.5-flash')
             
-            # Create prompt for image analysis
             prompt = f"""🔍 **Image Analysis Request**
 
 User asked: "{user_question}"
@@ -123,7 +301,6 @@ Keep the response engaging and conversational! 📸✨"""
             return None
             
         try:
-            # Convert image to base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
             response = openai.ChatCompletion.create(
@@ -156,18 +333,17 @@ Keep the response engaging and conversational! 📸✨"""
     
     def get_smart_ai_response(self, user_message, user_name="User", conversation_history=None):
         """Get AI response using multiple providers with smart routing"""
-        if not OPENAI_API_KEY and not GEMINI_API_KEY:
+        if not OPENAI_API_KEY and not (GEMINI_API_KEY and GEMINI_AVAILABLE):
             return "🤖 I'm sorry, but I'm not configured with AI capabilities at the moment. Please contact the page administrator."
         
-        # Determine which AI to use based on message characteristics
         use_gemini = self.should_use_gemini(user_message)
         
         try:
-            if use_gemini and GEMINI_API_KEY:
+            if use_gemini and GEMINI_API_KEY and GEMINI_AVAILABLE:
                 return self.get_gemini_response(user_message, user_name, conversation_history)
             elif OPENAI_API_KEY:
                 return self.get_openai_response(user_message, user_name, conversation_history)
-            elif GEMINI_API_KEY:
+            elif GEMINI_API_KEY and GEMINI_AVAILABLE:
                 return self.get_gemini_response(user_message, user_name, conversation_history)
             else:
                 return "🤖 AI services are currently unavailable. Please try again later!"
@@ -186,7 +362,6 @@ Keep the response engaging and conversational! 📸✨"""
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
             
-            # Build context-aware prompt
             prompt = f"""🌟 **AI Assistant Powered by Gemini** 🌟
 
 You are a helpful, friendly, and intelligent Facebook page bot. You should:
@@ -252,57 +427,69 @@ Current user: {user_name}
             'timestamp': datetime.now().isoformat()
         })
         
-        # Keep only last 5 exchanges to manage memory
         if len(self.conversation_memory[user_id]) > 5:
             self.conversation_memory[user_id] = self.conversation_memory[user_id][-5:]
     
     def get_conversation_context(self, user_id):
         """Get recent conversation context"""
         if user_id in self.conversation_memory:
-            recent = self.conversation_memory[user_id][-2:]  # Last 2 exchanges
+            recent = self.conversation_memory[user_id][-2:]
             return " | ".join([f"User: {ex['user_message']} Bot: {ex['bot_response'][:50]}..." for ex in recent])
         return None
     
     def handle_message(self, sender_id, message_text, sender_name=None):
-        """Process incoming message and generate intelligent response"""
+        """Process incoming message with security verification"""
         logger.info(f"Processing message from {sender_id}: {message_text}")
         
-        # Send typing indicator
+        # Check user verification status
+        is_verified, status = self.verify_user_access(sender_id)
+        
+        if not is_verified:
+            self.send_verification_request(sender_id, status)
+            return
+        
+        # If newly verified, send congratulations
+        if status == "newly_verified":
+            self.send_congratulations_with_image(sender_id)
+            return
+        
+        # User is verified, proceed with normal AI response
         self.send_typing_indicator(sender_id)
-        
-        # Get conversation context
         context = self.get_conversation_context(sender_id)
-        
-        # Generate intelligent response
         response = self.get_smart_ai_response(message_text, sender_name, context)
-        
-        # Update conversation memory
         self.update_conversation_memory(sender_id, message_text, response)
-        
-        # Send the response
         self.send_message(sender_id, response)
     
     def handle_image_message(self, sender_id, attachment_url, message_text="", sender_name=None):
-        """Handle image messages with AI analysis"""
+        """Handle image messages with security verification"""
         logger.info(f"Processing image from {sender_id}")
         
-        # Send typing indicator
+        # Check user verification status
+        is_verified, status = self.verify_user_access(sender_id)
+        
+        if not is_verified:
+            self.send_verification_request(sender_id, status)
+            return
+        
+        # If newly verified, send congratulations
+        if status == "newly_verified":
+            self.send_congratulations_with_image(sender_id)
+            return
+        
+        # User is verified, proceed with image analysis
         self.send_typing_indicator(sender_id)
         
-        # Download the image
         image_data = self.download_image(attachment_url)
         
         if not image_data:
             self.send_message(sender_id, "🖼️ Sorry, I couldn't download your image. Please try sending it again!")
             return
         
-        # Determine user's question about the image
         user_question = message_text if message_text.strip() else "What's in this image?"
         
-        # Try Gemini first for image analysis, then OpenAI
         response = None
         
-        if GEMINI_API_KEY:
+        if GEMINI_API_KEY and GEMINI_AVAILABLE:
             response = self.analyze_image_with_gemini(image_data, user_question)
         
         if not response and OPENAI_API_KEY:
@@ -311,13 +498,8 @@ Current user: {user_name}
         if not response:
             response = "🖼️ I can see you sent an image, but I'm having trouble analyzing it right now. Please try again later or describe what you'd like to know about it!"
         
-        # Add image analysis prefix
         final_response = f"🔍 **Image Analysis** 📸\n\n{response}"
-        
-        # Update conversation memory
         self.update_conversation_memory(sender_id, f"[Image] {user_question}", final_response)
-        
-        # Send the response
         self.send_message(sender_id, final_response)
 
 # Initialize enhanced bot
@@ -348,15 +530,11 @@ def handle_webhook():
                 for messaging_event in entry.get('messaging', []):
                     sender_id = messaging_event.get('sender', {}).get('id')
                     
-                    # Handle regular messages
                     if messaging_event.get('message'):
                         message_data = messaging_event['message']
                         message_text = message_data.get('text', '')
-                        
-                        # Get sender information
                         sender_name = get_user_name(sender_id)
                         
-                        # Handle image attachments
                         if message_data.get('attachments'):
                             for attachment in message_data['attachments']:
                                 if attachment.get('type') == 'image':
@@ -364,31 +542,28 @@ def handle_webhook():
                                     if image_url:
                                         bot.handle_image_message(sender_id, image_url, message_text, sender_name)
                                         break
-                        # Handle regular text messages
                         elif message_text:
                             bot.handle_message(sender_id, message_text, sender_name)
                     
-                    # Handle postbacks (button clicks)
                     elif messaging_event.get('postback'):
                         payload = messaging_event['postback'].get('payload')
                         if payload == 'GET_STARTED':
-                            welcome_message = """🌟 **Welcome to the Ultimate AI Assistant!** 🚀
+                            # Check verification status for get started
+                            is_verified, status = bot.verify_user_access(sender_id)
+                            if not is_verified:
+                                bot.send_verification_request(sender_id, status)
+                            elif status == "newly_verified":
+                                bot.send_congratulations_with_image(sender_id)
+                            else:
+                                welcome_message = """🌟 **Welcome Back!** 🚀
 
-I'm powered by multiple cutting-edge AI technologies:
+You're already verified! I'm your Ultimate AI Assistant powered by:
 🤖 ChatGPT for intelligent conversations
 🌟 Google Gemini for creative tasks
 🔍 Advanced image analysis capabilities
 
-✨ **What I can do:**
-💬 Answer any question intelligently
-🖼️ Analyze and explain images you send
-🎨 Help with creative tasks and brainstorming
-📚 Provide detailed explanations
-🧠 Remember our conversation context
-⚡ Respond instantly 24/7
-
-Just send me any message or image, and I'll understand and help you! No commands needed! 🍓🥰"""
-                            bot.send_message(sender_id, welcome_message)
+Just send me any message or image, and I'll help you! 🍓🥰"""
+                                bot.send_message(sender_id, welcome_message)
         
         return 'OK', 200
         
@@ -420,13 +595,14 @@ def health_check():
         'timestamp': datetime.now().isoformat(),
         'bot_configured': bool(PAGE_ACCESS_TOKEN and VERIFY_TOKEN),
         'openai_configured': bool(OPENAI_API_KEY),
-        'gemini_configured': bool(GEMINI_API_KEY),
+        'gemini_configured': bool(GEMINI_API_KEY and GEMINI_AVAILABLE),
         'features': {
             'smart_conversations': True,
-            'image_analysis': bool(OPENAI_API_KEY or GEMINI_API_KEY),
-            'multi_ai_providers': bool(OPENAI_API_KEY and GEMINI_API_KEY),
+            'image_analysis': bool(OPENAI_API_KEY or (GEMINI_API_KEY and GEMINI_AVAILABLE)),
+            'multi_ai_providers': bool(OPENAI_API_KEY and GEMINI_API_KEY and GEMINI_AVAILABLE),
             'conversation_memory': True,
-            'auto_responses': True
+            'auto_responses': True,
+            'security_verification': True
         }
     })
 
@@ -437,7 +613,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 Ultimate AI Facebook Bot</title>
+        <title>🤖 Ultimate AI Facebook Bot - Secured</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -474,6 +650,15 @@ def home():
                 margin-bottom: 30px;
                 opacity: 0.9;
             }}
+            .security-banner {{
+                background: linear-gradient(45deg, #ff6b6b, #feca57);
+                padding: 20px;
+                border-radius: 15px;
+                text-align: center;
+                margin: 20px 0;
+                color: white;
+                font-weight: bold;
+            }}
             .status-grid {{
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -503,6 +688,9 @@ def home():
                 border-radius: 10px;
                 border-left: 4px solid #4ecdc4;
             }}
+            .security-feature {{
+                border-left: 4px solid #ff6b6b;
+            }}
             .webhook-info {{
                 background: rgba(0, 0, 0, 0.2);
                 padding: 20px;
@@ -524,7 +712,12 @@ def home():
     <body>
         <div class="container">
             <h1>🤖 Ultimate AI Facebook Bot</h1>
-            <p class="subtitle">Powered by ChatGPT, Gemini & Advanced AI Technologies 🚀</p>
+            <p class="subtitle">Secured & Powered by ChatGPT, Gemini & Advanced AI 🚀</p>
+            
+            <div class="security-banner">
+                🔐 SECURED ACCESS SYSTEM ACTIVE 🔐<br>
+                Users must follow page & like posts to access AI features
+            </div>
             
             <div class="status-grid">
                 <div class="status-card">
@@ -546,6 +739,10 @@ def home():
             
             <h2>🌟 Enhanced Features</h2>
             <div class="features">
+                <div class="feature security-feature">
+                    <strong class="emoji">🔐</strong> <strong>Security Verification</strong><br>
+                    Users must follow page and like posts to access AI features
+                </div>
                 <div class="feature">
                     <strong class="emoji">🤖</strong> <strong>Multi-AI Intelligence</strong><br>
                     Powered by both ChatGPT and Google Gemini for the best responses
@@ -567,50 +764,46 @@ def home():
                     Brainstorming, creative writing, ideas, and artistic discussions
                 </div>
                 <div class="feature">
+                    <strong class="emoji">🎉</strong> <strong>Welcome Image System</strong><br>
+                    Custom congratulations image sent to verified users
+                </div>
+                <div class="feature">
                     <strong class="emoji">🌍</strong> <strong>24/7 Availability</strong><br>
-                    Always online, always ready to help with instant responses
-                </div>
-                <div class="feature">
-                    <strong class="emoji">🎯</strong> <strong>Context-Aware</strong><br>
-                    Understands the flow of conversation for better responses
-                </div>
-                <div class="feature">
-                    <strong class="emoji">📱</strong> <strong>Mobile Optimized</strong><br>
-                    Perfect experience on all devices and platforms
+                    Always online, always ready to help verified users
                 </div>
             </div>
             
             <div class="webhook-info">
                 <h3>📡 Webhook Configuration</h3>
                 <p>Webhook URL: <code>{webhook_url}</code></p>
-                <p>Ready to receive and process messages from Facebook!</p>
+                <p>Ready to receive and process secured messages from Facebook!</p>
             </div>
         </div>
     </body>
     </html>
     """.format(
         bot_status="✅" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "❌",
-        bot_text="Active & Ready" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "Not Configured",
+        bot_text="Active & Secured" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "Not Configured",
         openai_status="🤖" if OPENAI_API_KEY else "❌",
         openai_text="Connected" if OPENAI_API_KEY else "Not Configured",
-        gemini_status="🌟" if GEMINI_API_KEY else "❌",
-        gemini_text="Connected" if GEMINI_API_KEY else "Not Configured",
+        gemini_status="🌟" if GEMINI_API_KEY and GEMINI_AVAILABLE else "❌",
+        gemini_text="Connected" if GEMINI_API_KEY and GEMINI_AVAILABLE else "Not Available",
         webhook_url=f"{request.url_root.rstrip('/')}/webhook"
     )
 
 if __name__ == '__main__':
-    logger.info("🚀 Starting Ultimate AI Facebook Bot...")
+    logger.info("🚀 Starting Ultimate AI Facebook Bot with Security...")
     
-    # Check configuration
     if not PAGE_ACCESS_TOKEN:
         logger.warning("❌ FACEBOOK_PAGE_ACCESS_TOKEN not set")
     if not OPENAI_API_KEY:
         logger.warning("❌ OPENAI_API_KEY not set")
     if not GEMINI_API_KEY:
         logger.warning("❌ GEMINI_API_KEY not set")
+    if not GEMINI_AVAILABLE:
+        logger.warning("⚠️ Gemini libraries not available - using OpenAI only")
     
-    if OPENAI_API_KEY and GEMINI_API_KEY:
+    if OPENAI_API_KEY and GEMINI_API_KEY and GEMINI_AVAILABLE:
         logger.info("🌟 Multi-AI configuration detected - Full features available!")
     
-    # Run the app
     app.run(host='0.0.0.0', port=5000, debug=False)
