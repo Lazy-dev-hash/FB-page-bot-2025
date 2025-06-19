@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Configuration - you'll need to set these in Secrets
-VERIFY_TOKEN = os.getenv('FACEBOOK_VERIFY_TOKEN', 'your_verify_token_here')
+VERIFY_TOKEN = os.getenv('FACEBOOK_VERIFY_TOKEN', '@facebookbot')
 PAGE_ACCESS_TOKEN = os.getenv('FACEBOOK_PAGE_ACCESS_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
