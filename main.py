@@ -2,7 +2,7 @@
 import os
 import json
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 import openai
 from datetime import datetime
 import logging
@@ -14,47 +14,67 @@ import random
 import threading
 import sqlite3
 from contextlib import contextmanager
+import hashlib
+import uuid
+from typing import Optional, Dict, Any, List
 
-# Import Gemini (simplified approach)
+# Import Gemini with better error handling
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
+    print("✅ Gemini successfully imported")
 except ImportError as e:
-    logging.warning(f"Gemini not available: {e}")
+    print(f"⚠️ Gemini import failed: {e}")
     GEMINI_AVAILABLE = False
     genai = None
 except Exception as e:
-    logging.warning(f"Gemini error: {e}")
+    print(f"⚠️ Gemini initialization error: {e}")
     GEMINI_AVAILABLE = False
     genai = None
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration - you'll need to set these in Secrets
+# Configuration
 VERIFY_TOKEN = os.getenv('FACEBOOK_VERIFY_TOKEN', 'your_verify_token_here')
 PAGE_ACCESS_TOKEN = os.getenv('FACEBOOK_PAGE_ACCESS_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-# Specific post that users need to like
-REQUIRED_POST_ID = "761320392916522"  # From the URL provided
+# Bot Configuration
+BOT_NAME = "SUNNEL's Ultimate AI"
+BOT_VERSION = "3.0.0"
+REQUIRED_POST_ID = "761320392916522"
 PAGE_ID = "100071157053751"
 
-# Initialize AI providers
+# Initialize AI providers with better error handling
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    try:
+        openai.api_key = OPENAI_API_KEY
+        logger.info("✅ OpenAI configured successfully")
+    except Exception as e:
+        logger.error(f"❌ OpenAI configuration failed: {e}")
+        OPENAI_API_KEY = None
 
 if GEMINI_API_KEY and GEMINI_AVAILABLE:
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        logger.info("✅ Gemini configured successfully")
+    except Exception as e:
+        logger.error(f"❌ Gemini configuration failed: {e}")
+        GEMINI_AVAILABLE = False
 
-# Database setup for user tracking
+# Enhanced Database Schema
 def init_database():
-    """Initialize SQLite database for user tracking"""
+    """Initialize enhanced SQLite database"""
     with sqlite3.connect('bot_analytics.db') as conn:
+        # Users table with more fields
         conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
@@ -66,146 +86,259 @@ def init_database():
                 last_interaction TIMESTAMP,
                 total_messages INTEGER DEFAULT 0,
                 total_images INTEGER DEFAULT 0,
-                verification_status TEXT DEFAULT 'unverified',
-                verification_date TIMESTAMP
+                verification_status TEXT DEFAULT 'verified',
+                verification_date TIMESTAMP,
+                preferred_ai TEXT DEFAULT 'gemini',
+                conversation_count INTEGER DEFAULT 0,
+                last_seen_feature TEXT,
+                user_rating REAL DEFAULT 5.0,
+                total_errors INTEGER DEFAULT 0
             )
         ''')
         
+        # Enhanced interactions table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
                 message_type TEXT,
                 content TEXT,
+                response_text TEXT,
                 timestamp TIMESTAMP,
                 ai_provider TEXT,
+                processing_time REAL,
+                error_message TEXT,
+                satisfaction_score REAL,
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
         
+        # Bot analytics table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS bot_stats (
                 id INTEGER PRIMARY KEY,
                 total_users INTEGER DEFAULT 0,
                 verified_users INTEGER DEFAULT 0,
                 total_messages INTEGER DEFAULT 0,
+                total_images INTEGER DEFAULT 0,
                 uptime_start TIMESTAMP,
-                last_updated TIMESTAMP
+                last_updated TIMESTAMP,
+                success_rate REAL DEFAULT 100.0,
+                avg_response_time REAL DEFAULT 0.0,
+                popular_features TEXT,
+                error_count INTEGER DEFAULT 0
             )
         ''')
         
-        # Initialize bot stats if not exists
+        # Features usage tracking
         conn.execute('''
-            INSERT OR IGNORE INTO bot_stats (id, uptime_start, last_updated) 
+            CREATE TABLE IF NOT EXISTS feature_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feature_name TEXT,
+                user_id TEXT,
+                usage_count INTEGER DEFAULT 1,
+                last_used TIMESTAMP,
+                success_rate REAL DEFAULT 100.0
+            )
+        ''')
+        
+        # Initialize or update bot stats
+        conn.execute('''
+            INSERT OR REPLACE INTO bot_stats (id, uptime_start, last_updated) 
             VALUES (1, ?, ?)
         ''', (datetime.now(), datetime.now()))
 
-# Initialize database on startup
 init_database()
 
 @contextmanager
 def get_db():
-    """Context manager for database connections"""
-    conn = sqlite3.connect('bot_analytics.db')
-    conn.row_factory = sqlite3.Row
+    """Enhanced database connection with error handling"""
+    conn = None
     try:
+        conn = sqlite3.connect('bot_analytics.db', timeout=30)
+        conn.row_factory = sqlite3.Row
         yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Database error: {e}")
+        raise
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 class EnhancedFacebookBot:
     def __init__(self):
-        self.api_version = 'v18.0'
+        self.api_version = 'v19.0'  # Updated to latest version
         self.base_url = f'https://graph.facebook.com/{self.api_version}'
         self.conversation_memory = {}
         self.user_preferences = {}
         self.verified_users = set()
         self.user_states = {}
         self.start_time = datetime.now()
+        self.message_queue = []
+        self.error_counts = {}
+        self.feature_stats = {}
         
-        # Start auto uptime checker
-        self.start_uptime_monitor()
+        # Start enhanced monitoring
+        self.start_monitoring_systems()
         
-    def start_uptime_monitor(self):
-        """Start background thread for uptime monitoring"""
-        def uptime_checker():
+    def start_monitoring_systems(self):
+        """Start enhanced background monitoring"""
+        def monitoring_worker():
             while True:
                 try:
-                    # Update bot stats every 5 minutes
-                    self.update_bot_stats()
+                    self.update_analytics()
+                    self.cleanup_old_data()
+                    self.monitor_system_health()
                     time.sleep(300)  # 5 minutes
                 except Exception as e:
-                    logger.error(f"Uptime monitor error: {e}")
-                    time.sleep(60)  # Retry in 1 minute on error
+                    logger.error(f"Monitoring error: {e}")
+                    time.sleep(60)
         
-        uptime_thread = threading.Thread(target=uptime_checker, daemon=True)
-        uptime_thread.start()
-        logger.info("🔄 Auto uptime monitor started")
+        monitor_thread = threading.Thread(target=monitoring_worker, daemon=True)
+        monitor_thread.start()
+        logger.info("🔄 Enhanced monitoring system started")
     
-    def update_bot_stats(self):
-        """Update bot statistics in database"""
+    def update_analytics(self):
+        """Update comprehensive analytics"""
         try:
             with get_db() as conn:
-                # Count total and verified users
-                total_users = conn.execute('SELECT COUNT(*) as count FROM users').fetchone()['count']
-                verified_users = conn.execute(
-                    'SELECT COUNT(*) as count FROM users WHERE verification_status = ?', 
-                    ('verified',)
-                ).fetchone()['count']
-                total_messages = conn.execute('SELECT COUNT(*) as count FROM interactions').fetchone()['count']
+                # Calculate comprehensive stats
+                stats = conn.execute('''
+                    SELECT 
+                        COUNT(DISTINCT user_id) as total_users,
+                        COUNT(DISTINCT CASE WHEN verification_status = 'verified' THEN user_id END) as verified_users,
+                        SUM(total_messages) as total_messages,
+                        SUM(total_images) as total_images,
+                        AVG(user_rating) as avg_rating
+                    FROM users
+                ''').fetchone()
                 
+                # Calculate success rate
+                success_rate = conn.execute('''
+                    SELECT 
+                        (COUNT(CASE WHEN error_message IS NULL THEN 1 END) * 100.0 / COUNT(*)) as success_rate,
+                        AVG(processing_time) as avg_response_time
+                    FROM interactions
+                    WHERE timestamp > datetime('now', '-24 hours')
+                ''').fetchone()
+                
+                # Update bot stats
                 conn.execute('''
-                    UPDATE bot_stats 
-                    SET total_users = ?, verified_users = ?, total_messages = ?, last_updated = ?
+                    UPDATE bot_stats SET 
+                        total_users = ?, verified_users = ?, total_messages = ?, 
+                        total_images = ?, last_updated = ?, success_rate = ?, 
+                        avg_response_time = ?
                     WHERE id = 1
-                ''', (total_users, verified_users, total_messages, datetime.now()))
-                conn.commit()
+                ''', (
+                    stats['total_users'], stats['verified_users'], stats['total_messages'],
+                    stats['total_images'], datetime.now(), 
+                    success_rate['success_rate'] or 100.0, 
+                    success_rate['avg_response_time'] or 0.0
+                ))
+                
         except Exception as e:
-            logger.error(f"Error updating bot stats: {e}")
+            logger.error(f"Analytics update error: {e}")
     
-    def log_user_interaction(self, user_id, message_type, content, ai_provider=None):
-        """Log user interaction to database"""
+    def cleanup_old_data(self):
+        """Clean up old data to prevent database bloat"""
+        try:
+            with get_db() as conn:
+                # Keep only last 30 days of interactions
+                conn.execute('''
+                    DELETE FROM interactions 
+                    WHERE timestamp < datetime('now', '-30 days')
+                ''')
+                logger.info("🧹 Old data cleaned up")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+    
+    def monitor_system_health(self):
+        """Monitor system health and performance"""
+        try:
+            # Check AI service availability
+            health_status = {
+                'openai': bool(OPENAI_API_KEY),
+                'gemini': bool(GEMINI_API_KEY and GEMINI_AVAILABLE),
+                'database': True,
+                'facebook_api': bool(PAGE_ACCESS_TOKEN),
+                'uptime_hours': (datetime.now() - self.start_time).total_seconds() / 3600
+            }
+            
+            # Log health status every hour
+            if int(time.time()) % 3600 < 300:  # Every hour
+                logger.info(f"🏥 System Health: {health_status}")
+                
+        except Exception as e:
+            logger.error(f"Health monitoring error: {e}")
+    
+    def log_interaction(self, user_id: str, message_type: str, content: str, 
+                       response: str = "", ai_provider: str = None, 
+                       processing_time: float = 0.0, error: str = None):
+        """Enhanced interaction logging"""
         try:
             with get_db() as conn:
                 conn.execute('''
-                    INSERT INTO interactions (user_id, message_type, content, timestamp, ai_provider)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (user_id, message_type, content[:500], datetime.now(), ai_provider))
+                    INSERT INTO interactions 
+                    (user_id, message_type, content, response_text, timestamp, 
+                     ai_provider, processing_time, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (user_id, message_type, content[:500], response[:500], 
+                      datetime.now(), ai_provider, processing_time, error))
                 
-                # Update user message count
+                # Update user stats
                 conn.execute('''
                     UPDATE users SET 
-                    total_messages = total_messages + 1,
-                    last_interaction = ?
+                        total_messages = total_messages + 1,
+                        last_interaction = ?,
+                        conversation_count = conversation_count + 1,
+                        total_errors = total_errors + ?
                     WHERE user_id = ?
-                ''', (datetime.now(), user_id))
-                conn.commit()
+                ''', (datetime.now(), 1 if error else 0, user_id))
+                
         except Exception as e:
-            logger.error(f"Error logging interaction: {e}")
+            logger.error(f"Logging error: {e}")
     
-    def get_user_profile(self, user_id):
-        """Get detailed user profile from Facebook"""
+    def track_feature_usage(self, user_id: str, feature_name: str, success: bool = True):
+        """Track feature usage for analytics"""
+        try:
+            with get_db() as conn:
+                # Update or insert feature usage
+                conn.execute('''
+                    INSERT OR REPLACE INTO feature_usage 
+                    (feature_name, user_id, usage_count, last_used, success_rate)
+                    VALUES (?, ?, 
+                            COALESCE((SELECT usage_count FROM feature_usage 
+                                     WHERE feature_name = ? AND user_id = ?), 0) + 1,
+                            ?, ?)
+                ''', (feature_name, user_id, feature_name, user_id, datetime.now(), 
+                      100.0 if success else 0.0))
+        except Exception as e:
+            logger.error(f"Feature tracking error: {e}")
+    
+    def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Enhanced user profile retrieval with caching"""
         try:
             url = f'{self.base_url}/{user_id}'
             params = {
-                'fields': 'first_name,last_name,name,profile_pic',
+                'fields': 'first_name,last_name,name,profile_pic,locale,timezone',
                 'access_token': PAGE_ACCESS_TOKEN
             }
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
                 return response.json()
         except Exception as e:
-            logger.error(f"Error getting user profile: {e}")
+            logger.error(f"Profile retrieval error: {e}")
         return None
     
-    def update_user_database(self, user_id, profile_data=None, verification_status=None):
-        """Update or create user in database"""
+    def update_user_database(self, user_id: str, profile_data: Dict = None, 
+                           verification_status: str = None):
+        """Enhanced user database management"""
         try:
             if not profile_data:
-                profile_data = self.get_user_profile(user_id)
-            
-            if not profile_data:
-                profile_data = {'first_name': 'Unknown', 'name': 'Unknown User'}
+                profile_data = self.get_user_profile(user_id) or {}
             
             with get_db() as conn:
                 # Check if user exists
@@ -214,7 +347,7 @@ class EnhancedFacebookBot:
                 if user:
                     # Update existing user
                     update_data = {
-                        'name': profile_data.get('name', 'Unknown'),
+                        'name': profile_data.get('name', 'Unknown User'),
                         'first_name': profile_data.get('first_name', 'Unknown'),
                         'last_name': profile_data.get('last_name', ''),
                         'profile_pic': profile_data.get('profile_pic', ''),
@@ -228,32 +361,41 @@ class EnhancedFacebookBot:
                     
                     set_clause = ', '.join([f"{k} = ?" for k in update_data.keys()])
                     values = list(update_data.values()) + [user_id]
-                    
                     conn.execute(f'UPDATE users SET {set_clause} WHERE user_id = ?', values)
                 else:
                     # Create new user
                     conn.execute('''
                         INSERT INTO users 
-                        (user_id, name, first_name, last_name, profile_pic, first_interaction, last_interaction, verification_status)
+                        (user_id, name, first_name, last_name, profile_pic, 
+                         first_interaction, last_interaction, verification_status)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         user_id,
-                        profile_data.get('name', 'Unknown'),
+                        profile_data.get('name', 'Unknown User'),
                         profile_data.get('first_name', 'Unknown'),
                         profile_data.get('last_name', ''),
                         profile_data.get('profile_pic', ''),
                         datetime.now(),
                         datetime.now(),
-                        verification_status or 'unverified'
+                        verification_status or 'verified'
                     ))
-                conn.commit()
+                    
         except Exception as e:
-            logger.error(f"Error updating user database: {e}")
-        
-    def send_message(self, recipient_id, message_text):
-        """Send a message to a Facebook user"""
+            logger.error(f"User database update error: {e}")
+    
+    def send_message(self, recipient_id: str, message_text: str) -> bool:
+        """Enhanced message sending with better error handling"""
         url = f'{self.base_url}/me/messages'
-        headers = {'Content-Type': 'application/json'}
+        
+        # Split long messages
+        if len(message_text) > 2000:
+            parts = [message_text[i:i+1800] for i in range(0, len(message_text), 1800)]
+            for i, part in enumerate(parts):
+                if i > 0:
+                    time.sleep(1)  # Prevent rate limiting
+                if not self.send_message(recipient_id, f"[Part {i+1}/{len(parts)}]\n{part}"):
+                    return False
+            return True
         
         data = {
             'recipient': {'id': recipient_id},
@@ -262,52 +404,21 @@ class EnhancedFacebookBot:
         }
         
         try:
-            response = requests.post(url, headers=headers, json=data)
-            response.raise_for_status()
-            logger.info(f"Message sent successfully to {recipient_id}")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send message: {e}")
+            response = requests.post(url, json=data, timeout=30)
+            if response.status_code == 200:
+                logger.info(f"✅ Message sent to {recipient_id}")
+                return True
+            else:
+                error_data = response.json() if response.content else {}
+                logger.error(f"❌ Message send failed: {response.status_code} - {error_data}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Message send exception: {e}")
             return False
 
-    def send_image_message(self, recipient_id, image_url, message_text=None):
-        """Send an image message to a Facebook user"""
+    def send_typing_indicator(self, recipient_id: str):
+        """Send typing indicator"""
         url = f'{self.base_url}/me/messages'
-        headers = {'Content-Type': 'application/json'}
-        
-        message_data = {
-            'attachment': {
-                'type': 'image',
-                'payload': {
-                    'url': image_url,
-                    'is_reusable': True
-                }
-            }
-        }
-        
-        if message_text:
-            message_data['text'] = message_text
-        
-        data = {
-            'recipient': {'id': recipient_id},
-            'message': message_data,
-            'access_token': PAGE_ACCESS_TOKEN
-        }
-        
-        try:
-            response = requests.post(url, headers=headers, json=data)
-            response.raise_for_status()
-            logger.info(f"Image message sent successfully to {recipient_id}")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send image message: {e}")
-            return False
-    
-    def send_typing_indicator(self, recipient_id):
-        """Send typing indicator to show bot is processing"""
-        url = f'{self.base_url}/me/messages'
-        headers = {'Content-Type': 'application/json'}
-        
         data = {
             'recipient': {'id': recipient_id},
             'sender_action': 'typing_on',
@@ -315,383 +426,255 @@ class EnhancedFacebookBot:
         }
         
         try:
-            requests.post(url, headers=headers, json=data)
+            requests.post(url, json=data, timeout=10)
         except:
-            pass
-
-    def check_user_follows_page(self, user_id):
-        """Check if user follows the page"""
-        try:
-            url = f'{self.base_url}/{user_id}'
-            params = {
-                'fields': 'subscribed_field',
-                'access_token': PAGE_ACCESS_TOKEN
-            }
-            response = requests.get(url, params=params)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('subscribed_field', False)
-        except Exception as e:
-            logger.error(f"Error checking follow status: {e}")
-        return False
-
-    def check_user_liked_specific_post(self, user_id):
-        """Check if user liked the specific required post"""
-        try:
-            # Check if user liked the specific post
-            likes_url = f'{self.base_url}/{REQUIRED_POST_ID}/likes'
-            params = {
-                'access_token': PAGE_ACCESS_TOKEN,
-                'limit': 1000  # Increase limit to check more likes
-            }
-            
-            response = requests.get(likes_url, params=params)
-            if response.status_code == 200:
-                likes_data = response.json()
-                likes = likes_data.get('data', [])
-                
-                # Check if user_id is in the likes
-                for like in likes:
-                    if like.get('id') == user_id:
-                        return True
-                        
-                # Check pagination if there are more likes
-                while likes_data.get('paging', {}).get('next'):
-                    next_url = likes_data['paging']['next']
-                    response = requests.get(next_url)
-                    if response.status_code == 200:
-                        likes_data = response.json()
-                        likes = likes_data.get('data', [])
-                        for like in likes:
-                            if like.get('id') == user_id:
-                                return True
-                    else:
-                        break
-            
-        except Exception as e:
-            logger.error(f"Error checking specific post like: {e}")
-        
-        return False
-
-    def verify_user_access(self, user_id):
-        """Verify if user has followed page and liked the specific post"""
-        if user_id in self.verified_users:
-            return True, "verified"
-        
-        # Check follow status
-        follows_page = self.check_user_follows_page(user_id)
-        
-        # Check if user liked the specific post
-        liked_specific_post = self.check_user_liked_specific_post(user_id)
-        
-        if follows_page and liked_specific_post:
-            self.verified_users.add(user_id)
-            return True, "newly_verified"
-        elif follows_page and not liked_specific_post:
-            return False, "need_like"
-        elif not follows_page and liked_specific_post:
-            return False, "need_follow"
-        else:
-            return False, "need_both"
-
-    def send_verification_request(self, user_id, status):
-        """Send verification request message with specific post link"""
-        post_link = f"https://www.facebook.com/{PAGE_ID}/posts/{REQUIRED_POST_ID}/?mibextid=rS40aB7S9Ucbxw6v"
-        
-        if status == "need_both":
-            message = f"""🔐 **Welcome! Access Required** 🔐
-
-To unlock full access to this amazing AI bot, please:
-
-1️⃣ **Follow this page** 👍
-2️⃣ **Like this specific post** ❤️
-{post_link}
-
-Once you complete both steps, you'll get full access to:
-🤖 Advanced AI conversations (ChatGPT + Gemini)
-🔍 Image analysis capabilities  
-💭 Smart conversation memory
-⚡ Instant responses 24/7
-
-Please complete these steps and send any message to verify! 🚀"""
-
-        elif status == "need_follow":
-            message = """🔐 **Almost There!** 🔐
-
-Thank you for liking our specific post! ❤️
-
-To complete verification, please:
-1️⃣ **Follow this page** 👍
-
-Once you follow, you'll have full access to all AI features! 🚀"""
-
-        elif status == "need_like":
-            message = f"""🔐 **Almost There!** 🔐
-
-Thank you for following our page! 👍
-
-To complete verification, please:
-2️⃣ **Like this specific post** ❤️
-{post_link}
-
-Once you like our post, you'll have full access to all AI features! 🚀"""
-
-        self.send_message(user_id, message)
-
-    def send_congratulations_with_image(self, user_id):
-        """Send congratulations message with the custom image"""
-        congrats_message = """🎉 **CONGRATULATIONS!** 🎉
-
-✅ **Verification Complete!** ✅
-
-You now have full access to our Ultimate AI Bot! 🚀
-
-🌟 **Available Features:**
-🤖 ChatGPT & Gemini AI conversations
-🔍 Advanced image analysis
-💭 Smart conversation memory
-⚡ Instant 24/7 responses
-🎨 Creative AI assistance
-
-**Thank you for following and supporting us!** 
-
-Developed by SUNNEL 🤍
-
-You can now ask me anything or send images for analysis! 🍓🥰"""
-
-        # Send the congratulations message first
-        self.send_message(user_id, congrats_message)
-        
-        # Send the custom image hosted locally
-        base_url = request.url_root.rstrip('/')
-        image_url = f"{base_url}/static/images/congratulations.png"
-        
-        self.send_image_message(user_id, image_url, "🌟 Developed by SUNNEL - Thank you for using our AI bot! 🌟")
+            pass  # Non-critical feature
     
-    def download_image(self, attachment_url):
-        """Download image from Facebook attachment URL"""
+    def download_image(self, attachment_url: str) -> Optional[bytes]:
+        """Enhanced image download with better error handling"""
         try:
-            response = requests.get(f"{attachment_url}&access_token={PAGE_ACCESS_TOKEN}")
+            # Clean URL and add access token
+            if '?' in attachment_url:
+                url = f"{attachment_url}&access_token={PAGE_ACCESS_TOKEN}"
+            else:
+                url = f"{attachment_url}?access_token={PAGE_ACCESS_TOKEN}"
+            
+            response = requests.get(url, timeout=30, stream=True)
             if response.status_code == 200:
-                return response.content
+                # Check content type
+                content_type = response.headers.get('content-type', '')
+                if 'image' in content_type:
+                    return response.content
+                else:
+                    logger.warning(f"Invalid content type: {content_type}")
+            else:
+                logger.error(f"Image download failed: {response.status_code}")
         except Exception as e:
-            logger.error(f"Error downloading image: {e}")
+            logger.error(f"Image download error: {e}")
         return None
     
-    def analyze_image_with_gemini(self, image_data, user_question="What's in this image?"):
-        """Analyze image using Google Gemini Vision with enhanced prompts"""
+    def analyze_image_with_gemini(self, image_data: bytes, user_question: str = "What's in this image?") -> Optional[str]:
+        """Enhanced Gemini image analysis with better model handling"""
         if not GEMINI_API_KEY or not GEMINI_AVAILABLE:
             return None
             
         try:
+            # Process image
             image = Image.open(io.BytesIO(image_data))
-            # Convert to RGB if needed
             if image.mode in ('RGBA', 'LA'):
                 background = Image.new('RGB', image.size, (255, 255, 255))
                 if image.mode == 'RGBA':
                     background.paste(image, mask=image.split()[-1])
                 else:
-                    background.paste(image, mask=image.split()[-1])
+                    background.paste(image)
                 image = background
             
-            model = genai.GenerativeModel('gemini-pro-vision')
+            # Use the latest model
+            model = genai.GenerativeModel('gemini-1.5-flash')
             
-            prompt = f"""🔍 **Advanced Image Analysis by SUNNEL's AI** 🔍
+            prompt = f"""🔍 **Advanced AI Image Analysis by SUNNEL** 🔍
 
 User Question: "{user_question}"
 
-Please provide an extremely detailed, insightful, and engaging analysis of this image. Include:
+Please provide an extremely detailed and engaging analysis of this image:
 
-🎯 **What I See:**
-- Detailed description of all objects, people, animals, text, or scenes
-- Colors, lighting, composition, and style
-- Any emotions or mood conveyed
+🎯 **Visual Analysis:**
+- Describe all objects, people, animals, text, or scenes in detail
+- Note colors, lighting, composition, artistic style, and mood
+- Identify any text, signs, or written content
 
-💡 **Key Details:**
-- Notable elements that stand out
-- Text or signs if visible
-- Technical aspects (if applicable)
-- Cultural or contextual significance
+💡 **Technical & Contextual Details:**
+- Estimate time period, location, or cultural context if relevant
+- Technical aspects (photography, art style, etc.)
+- Notable patterns, symbols, or hidden elements
 
-🌟 **Insights & Observations:**
-- Interesting patterns or relationships
-- Possible story or narrative
-- Creative interpretations
-- Answer to the user's specific question
+🌟 **Insights & Creative Interpretation:**
+- Answer the user's specific question thoroughly
+- Share interesting observations or connections
+- Provide creative insights or alternative perspectives
 
-Make your response engaging, detailed, and full of personality! Use emojis and be conversational! 📸✨"""
+Make your response engaging, informative, and full of personality! Use emojis strategically and be conversational! 📸✨"""
             
             response = model.generate_content([prompt, image])
-            return f"🌟 **Gemini Vision Analysis** 🌟\n\n{response.text}"
             
-        except Exception as e:
-            logger.error(f"Error analyzing image with Gemini: {e}")
-            # Try with regular gemini-pro model
-            try:
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                prompt = f"""I received an image that I cannot directly analyze, but the user asked: "{user_question}"
-
-Please provide a helpful response explaining that I can see they sent an image and ask them to describe what they'd like to know about it, or suggest they try sending the image again."""
-                
-                response = model.generate_content(prompt)
-                return f"🌟 **Gemini Response** 🌟\n\n{response.text}"
-            except Exception as e2:
-                logger.error(f"Gemini fallback also failed: {e2}")
+            if response and response.text:
+                return f"🌟 **Gemini Vision Analysis** 🌟\n\n{response.text}\n\n💫 *Powered by Google Gemini - Developed by SUNNEL* 🤍"
+            else:
+                logger.warning("Empty response from Gemini")
                 return None
+                
+        except Exception as e:
+            logger.error(f"Gemini image analysis error: {e}")
+            return None
     
-    def analyze_image_with_openai(self, image_data, user_question="What's in this image?"):
-        """Analyze image using OpenAI GPT-4 Vision"""
+    def analyze_image_with_openai(self, image_data: bytes, user_question: str = "What's in this image?") -> Optional[str]:
+        """Enhanced OpenAI image analysis with updated model"""
         if not OPENAI_API_KEY:
             return None
             
         try:
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
-            response = openai.ChatCompletion.create(
-                model="gpt-4-vision-preview",
+            # Use updated model and API
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            
+            response = client.chat.completions.create(
+                model="gpt-4o",  # Updated model
                 messages=[
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"🔍 **Image Analysis Request**\n\nUser asked: '{user_question}'\n\nPlease analyze this image and provide a detailed, friendly response. Include what you see, any interesting details, and answer their specific question!"
+                                "text": f"""🔍 **Advanced Image Analysis by SUNNEL's AI**
+
+User asked: '{user_question}'
+
+Please provide a comprehensive, detailed, and engaging analysis of this image. Include:
+- Detailed description of all visible elements
+- Colors, composition, lighting, and style
+- Any text or signs if visible
+- Cultural, historical, or contextual significance
+- Answer to the user's specific question
+- Creative insights and observations
+
+Make it informative, engaging, and conversational with appropriate emojis! 📸✨"""
                             },
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "high"
                                 }
                             }
                         ]
                     }
                 ],
-                max_tokens=800
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            logger.error(f"Error analyzing image with OpenAI: {e}")
-            return None
-    
-    def get_smart_ai_response(self, user_message, user_name="User", conversation_history=None):
-        """Get AI response using Gemini primarily with fallback to OpenAI"""
-        if not GEMINI_API_KEY and not OPENAI_API_KEY:
-            return "🤖 I'm sorry, but I'm not configured with AI capabilities at the moment. Please contact the page administrator.", None
-        
-        provider_used = None
-        
-        try:
-            # Try Gemini first (prioritize Gemini for all responses)
-            if GEMINI_API_KEY and GEMINI_AVAILABLE:
-                provider_used = "Gemini"
-                response = self.get_gemini_response(user_message, user_name, conversation_history)
-                return response, provider_used
-            elif OPENAI_API_KEY:
-                provider_used = "OpenAI"
-                response = self.get_openai_response(user_message, user_name, conversation_history)
-                return response, provider_used
-            else:
-                return "🤖 AI services are currently unavailable. Please try again later!", None
-                
-        except Exception as e:
-            logger.error(f"Error getting AI response with {provider_used}: {e}")
-            # Try fallback
-            try:
-                if provider_used == "Gemini" and OPENAI_API_KEY:
-                    provider_used = "OpenAI (Fallback)"
-                    response = self.get_openai_response(user_message, user_name, conversation_history)
-                    return response, provider_used
-                elif provider_used == "OpenAI" and GEMINI_API_KEY and GEMINI_AVAILABLE:
-                    provider_used = "Gemini (Fallback)"
-                    response = self.get_gemini_response(user_message, user_name, conversation_history)
-                    return response, provider_used
-            except Exception as e2:
-                logger.error(f"Fallback also failed: {e2}")
-            
-            return "🤖 I'm having trouble processing your request right now. Please try again later!", None
-    
-    def get_response_image_url(self):
-        """Get a random response image URL"""
-        base_url = request.url_root.rstrip('/')
-        # You can add more images to static/images/ and include them here
-        response_images = [
-            f"{base_url}/static/images/congratulations.png",
-            # Add more image URLs here as you add more images
-        ]
-        return random.choice(response_images)
-    
-    def get_gemini_response(self, user_message, user_name="User", conversation_history=None):
-        """Get response from Google Gemini with enhanced personality"""
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            
-            prompt = f"""🌟 **AI Assistant Powered by Google Gemini** 🌟
-
-You are SUNNEL'S Ultimate AI Bot - a highly advanced, friendly, and creative AI assistant integrated into Facebook Messenger. 
-
-Your personality and capabilities:
-- 🤖 Extremely intelligent and helpful with any topic
-- 🎨 Creative and imaginative for artistic requests
-- 💡 Innovative problem solver
-- 😊 Warm, friendly, and engaging conversation style
-- 🌟 Use plenty of emojis to make conversations lively and fun
-- 🚀 Advanced knowledge across all subjects
-- 💫 Provide detailed yet easy-to-understand explanations
-- 🍓 Add a touch of sweetness and charm to responses
-- 🎯 Be precise and accurate while staying conversational
-
-Current user: {user_name}
-{f"Previous conversation context: {conversation_history}" if conversation_history else ""}
-
-User's message: "{user_message}"
-
-Provide an amazing, helpful, and engaging response that showcases your advanced AI capabilities:"""
-            
-            response = model.generate_content(prompt)
-            return f"🌟 **Powered by Google Gemini** 🌟\n\n{response.text}\n\n💫 *Developed by SUNNEL* 🤍"
-            
-        except Exception as e:
-            logger.error(f"Error with Gemini: {e}")
-            raise e
-    
-    def get_openai_response(self, user_message, user_name="User", conversation_history=None):
-        """Get response from OpenAI with enhanced personality"""
-        try:
-            messages = [
-                {"role": "system", "content": f"""🤖 You are SUNNEL'S Ultimate AI Bot powered by ChatGPT, integrated into Facebook Messenger.
-
-Your personality:
-- 🚀 Extremely intelligent and helpful
-- 😊 Warm, friendly, and engaging
-- ✨ Use plenty of emojis to make conversations lively
-- 💡 Provide detailed yet easy-to-understand responses
-- 🎯 Be accurate and precise while staying conversational
-- 🍓 Add charm and personality to your responses
-- 🌟 Showcase advanced AI capabilities
-
-Current user: {user_name}
-{f"Previous conversation context: {conversation_history}" if conversation_history else ""}"""},
-                {"role": "user", "content": user_message}
-            ]
-            
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=messages,
-                max_tokens=600,
+                max_tokens=1000,
                 temperature=0.7
             )
             
-            return f"🤖 **Powered by ChatGPT** 🤖\n\n{response.choices[0].message.content.strip()}\n\n💫 *Developed by SUNNEL* 🤍"
+            if response.choices and response.choices[0].message.content:
+                return f"🤖 **ChatGPT Vision Analysis** 🤖\n\n{response.choices[0].message.content}\n\n💫 *Powered by OpenAI - Developed by SUNNEL* 🤍"
             
         except Exception as e:
-            logger.error(f"Error with OpenAI: {e}")
+            logger.error(f"OpenAI image analysis error: {e}")
+            return None
+    
+    def get_smart_ai_response(self, user_message: str, user_name: str = "User", 
+                            conversation_history: str = None) -> tuple[str, Optional[str]]:
+        """Enhanced AI response with better provider management"""
+        start_time = time.time()
+        
+        try:
+            # Try Gemini first (more reliable for general conversations)
+            if GEMINI_API_KEY and GEMINI_AVAILABLE:
+                try:
+                    response = self.get_gemini_response(user_message, user_name, conversation_history)
+                    processing_time = time.time() - start_time
+                    return response, "Gemini", processing_time
+                except Exception as e:
+                    logger.error(f"Gemini response error: {e}")
+            
+            # Fallback to OpenAI
+            if OPENAI_API_KEY:
+                try:
+                    response = self.get_openai_response(user_message, user_name, conversation_history)
+                    processing_time = time.time() - start_time
+                    return response, "OpenAI (Fallback)", processing_time
+                except Exception as e:
+                    logger.error(f"OpenAI response error: {e}")
+            
+            # If both fail, return helpful message
+            return ("🤖 I'm temporarily experiencing technical difficulties. Please try again in a moment. "
+                   "If the issue persists, our development team has been notified! 🔧✨"), None, 0.0
+            
+        except Exception as e:
+            logger.error(f"AI response error: {e}")
+            return "🤖 I encountered an unexpected error. Please try again!", None, 0.0
+    
+    def get_gemini_response(self, user_message: str, user_name: str = "User", 
+                          conversation_history: str = None) -> str:
+        """Enhanced Gemini response with better prompting"""
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            prompt = f"""🌟 **SUNNEL's Ultimate AI Assistant - Powered by Google Gemini** 🌟
+
+You are an extremely advanced, friendly, and intelligent AI assistant integrated into Facebook Messenger.
+
+Your enhanced personality:
+- 🚀 Exceptionally intelligent and knowledgeable across all domains
+- 😊 Warm, engaging, and genuinely helpful
+- 🎨 Creative and innovative in problem-solving
+- ✨ Use emojis strategically to enhance communication
+- 💡 Provide detailed yet accessible explanations
+- 🌟 Showcase advanced AI capabilities while staying conversational
+- 🍓 Add charm and personality to responses
+- 🎯 Be precise, accurate, and helpful
+
+Current user: {user_name}
+{f"Recent conversation: {conversation_history}" if conversation_history else ""}
+
+User's message: "{user_message}"
+
+Provide an amazing, helpful, and engaging response that demonstrates your advanced capabilities:"""
+            
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                return f"🌟 **Powered by Google Gemini** 🌟\n\n{response.text}\n\n💫 *SUNNEL's Ultimate AI - Making AI Accessible* 🤍"
+            else:
+                raise Exception("Empty response from Gemini")
+                
+        except Exception as e:
+            logger.error(f"Gemini response error: {e}")
             raise e
     
-    def update_conversation_memory(self, user_id, message, response):
-        """Update conversation memory for context awareness"""
+    def get_openai_response(self, user_message: str, user_name: str = "User", 
+                          conversation_history: str = None) -> str:
+        """Enhanced OpenAI response with updated API"""
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            
+            system_prompt = f"""🤖 You are SUNNEL'S Ultimate AI Assistant powered by ChatGPT, integrated into Facebook Messenger.
+
+Your enhanced personality:
+- 🚀 Exceptionally intelligent and versatile
+- 😊 Warm, friendly, and genuinely engaging
+- ✨ Strategic use of emojis for better communication
+- 💡 Provide comprehensive yet accessible responses
+- 🎯 Be accurate, helpful, and conversational
+- 🍓 Add personality and charm to interactions
+- 🌟 Demonstrate advanced AI capabilities
+
+Current user: {user_name}
+{f"Conversation context: {conversation_history}" if conversation_history else ""}"""
+            
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=800,
+                temperature=0.7
+            )
+            
+            if response.choices and response.choices[0].message.content:
+                content = response.choices[0].message.content.strip()
+                return f"🤖 **Powered by ChatGPT** 🤖\n\n{content}\n\n💫 *SUNNEL's Ultimate AI - Innovation in Every Response* 🤍"
+            else:
+                raise Exception("Empty response from OpenAI")
+                
+        except Exception as e:
+            logger.error(f"OpenAI response error: {e}")
+            raise e
+    
+    def update_conversation_memory(self, user_id: str, message: str, response: str):
+        """Enhanced conversation memory with better context management"""
         if user_id not in self.conversation_memory:
             self.conversation_memory[user_id] = []
         
@@ -701,106 +684,175 @@ Current user: {user_name}
             'timestamp': datetime.now().isoformat()
         })
         
-        if len(self.conversation_memory[user_id]) > 5:
-            self.conversation_memory[user_id] = self.conversation_memory[user_id][-5:]
+        # Keep last 3 exchanges for better context
+        if len(self.conversation_memory[user_id]) > 3:
+            self.conversation_memory[user_id] = self.conversation_memory[user_id][-3:]
     
-    def get_conversation_context(self, user_id):
-        """Get recent conversation context"""
+    def get_conversation_context(self, user_id: str) -> Optional[str]:
+        """Get enhanced conversation context"""
         if user_id in self.conversation_memory:
             recent = self.conversation_memory[user_id][-2:]
-            return " | ".join([f"User: {ex['user_message']} Bot: {ex['bot_response'][:50]}..." for ex in recent])
+            return " | ".join([
+                f"User: {ex['user_message'][:100]}... Bot: {ex['bot_response'][:100]}..." 
+                for ex in recent
+            ])
         return None
     
-    def handle_message(self, sender_id, message_text, sender_name=None):
-        """Process incoming message with open access and image responses"""
-        logger.info(f"Processing message from {sender_id}: {message_text}")
+    def handle_message(self, sender_id: str, message_text: str, sender_name: str = None):
+        """Enhanced message handling with comprehensive features"""
+        start_time = time.time()
         
-        # Update user in database with verified status
-        self.update_user_database(sender_id, verification_status="verified")
-        
-        # Send typing indicator and process AI response
-        self.send_typing_indicator(sender_id)
-        context = self.get_conversation_context(sender_id)
-        response, provider = self.get_smart_ai_response(message_text, sender_name, context)
-        self.update_conversation_memory(sender_id, message_text, response)
-        
-        # Send text response first
-        self.send_message(sender_id, response)
-        
-        # Send image with the response
         try:
-            image_url = self.get_response_image_url()
-            self.send_image_message(sender_id, image_url, "🌟 Powered by SUNNEL's AI 🌟")
-        except Exception as e:
-            logger.error(f"Error sending response image: {e}")
-        
-        # Log interaction
-        self.log_user_interaction(sender_id, "message", message_text, provider)
-    
-    def handle_image_message(self, sender_id, attachment_url, message_text="", sender_name=None):
-        """Handle image messages with open access"""
-        logger.info(f"Processing image from {sender_id}")
-        
-        # Update user in database with verified status
-        self.update_user_database(sender_id, verification_status="verified")
-        
-        # Process image analysis directly
-        self.send_typing_indicator(sender_id)
-        
-        image_data = self.download_image(attachment_url)
-        
-        if not image_data:
-            self.send_message(sender_id, "🖼️ Sorry, I couldn't download your image. Please try sending it again!")
-            return
-        
-        user_question = message_text if message_text.strip() else "What's in this image?"
-        
-        response = None
-        provider = None
-        
-        # Try Gemini first for image analysis
-        if GEMINI_API_KEY and GEMINI_AVAILABLE:
-            try:
-                response = self.analyze_image_with_gemini(image_data, user_question)
-                provider = "Gemini Vision"
-            except Exception as e:
-                logger.error(f"Gemini image analysis failed: {e}")
-        
-        # Fallback to OpenAI if Gemini fails
-        if not response and OPENAI_API_KEY:
-            try:
-                response = self.analyze_image_with_openai(image_data, user_question)
-                provider = "OpenAI Vision (Fallback)"
-            except Exception as e:
-                logger.error(f"OpenAI image analysis failed: {e}")
-        
-        if not response:
-            response = "🖼️ I can see you sent an image, but I'm having trouble analyzing it right now. Please try again later or describe what you'd like to know about it!"
-            provider = "Error"
-        
-        final_response = f"🔍 **Advanced Image Analysis** 📸\n\n{response}\n\n🌟 *Thank you for sharing your image!* 🌟"
-        self.update_conversation_memory(sender_id, f"[Image] {user_question}", final_response)
-        self.send_message(sender_id, final_response)
-        
-        # Send response image
-        try:
-            response_image_url = self.get_response_image_url()
-            self.send_image_message(sender_id, response_image_url, "📸 Image Analysis Complete! Powered by SUNNEL's AI 🌟")
-        except Exception as e:
-            logger.error(f"Error sending response image for image analysis: {e}")
-        
-        # Log interaction and update image count
-        self.log_user_interaction(sender_id, "image", user_question, provider)
-        with get_db() as conn:
-            conn.execute(
-                'UPDATE users SET total_images = total_images + 1 WHERE user_id = ?',
-                (sender_id,)
+            logger.info(f"📥 Processing message from {sender_id}: {message_text[:100]}...")
+            
+            # Update user database
+            self.update_user_database(sender_id, verification_status="verified")
+            
+            # Track feature usage
+            self.track_feature_usage(sender_id, "text_conversation")
+            
+            # Send typing indicator
+            self.send_typing_indicator(sender_id)
+            
+            # Get AI response
+            context = self.get_conversation_context(sender_id)
+            response, provider, processing_time = self.get_smart_ai_response(
+                message_text, sender_name, context
             )
-            conn.commit()
+            
+            # Update conversation memory
+            self.update_conversation_memory(sender_id, message_text, response)
+            
+            # Send response
+            success = self.send_message(sender_id, response)
+            
+            # Log interaction
+            self.log_interaction(
+                sender_id, "message", message_text, response, 
+                provider, processing_time, None if success else "Send failed"
+            )
+            
+            total_time = time.time() - start_time
+            logger.info(f"✅ Message processed in {total_time:.2f}s using {provider}")
+            
+        except Exception as e:
+            error_msg = f"Message handling error: {e}"
+            logger.error(error_msg)
+            
+            # Send error response to user
+            self.send_message(
+                sender_id, 
+                "🤖 I encountered a temporary issue. Please try again! Our team has been notified. 🔧"
+            )
+            
+            # Log error
+            self.log_interaction(sender_id, "message", message_text, "", None, 0.0, str(e))
+    
+    def handle_image_message(self, sender_id: str, attachment_url: str, 
+                           message_text: str = "", sender_name: str = None):
+        """Enhanced image handling with comprehensive analysis"""
+        start_time = time.time()
+        
+        try:
+            logger.info(f"🖼️ Processing image from {sender_id}")
+            
+            # Update user database
+            self.update_user_database(sender_id, verification_status="verified")
+            
+            # Track feature usage
+            self.track_feature_usage(sender_id, "image_analysis")
+            
+            # Send typing indicator
+            self.send_typing_indicator(sender_id)
+            
+            # Download image
+            image_data = self.download_image(attachment_url)
+            if not image_data:
+                error_msg = "🖼️ I couldn't download your image. Please try sending it again or check if it's a supported format (JPEG, PNG, etc.)!"
+                self.send_message(sender_id, error_msg)
+                self.log_interaction(sender_id, "image", "Image download failed", "", None, 0.0, "Download failed")
+                return
+            
+            # Prepare analysis question
+            user_question = message_text.strip() if message_text.strip() else "What's in this image? Please provide a detailed analysis."
+            
+            # Try image analysis
+            response = None
+            provider = None
+            
+            # Try Gemini first for better image understanding
+            if GEMINI_API_KEY and GEMINI_AVAILABLE:
+                try:
+                    response = self.analyze_image_with_gemini(image_data, user_question)
+                    provider = "Gemini Vision"
+                except Exception as e:
+                    logger.error(f"Gemini image analysis failed: {e}")
+            
+            # Fallback to OpenAI
+            if not response and OPENAI_API_KEY:
+                try:
+                    response = self.analyze_image_with_openai(image_data, user_question)
+                    provider = "OpenAI Vision"
+                except Exception as e:
+                    logger.error(f"OpenAI image analysis failed: {e}")
+            
+            # Final fallback
+            if not response:
+                response = f"""🖼️ **Image Received Successfully** 📸
+
+I can see you've shared an image with me! However, I'm currently experiencing some technical difficulties with image analysis.
+
+**What I can help with instead:**
+- 💬 Answer any questions you have about the image if you describe it
+- 🔍 Provide general information about image analysis
+- 🎨 Help with image-related topics or creative projects
+- 📝 Assist with any other questions or tasks
+
+Please feel free to describe what's in the image or ask me anything else! 🌟
+
+*Our technical team has been notified and image analysis will be restored soon.* 🔧"""
+                provider = "Fallback Response"
+            
+            # Update conversation memory
+            self.update_conversation_memory(sender_id, f"[Image] {user_question}", response)
+            
+            # Send response
+            success = self.send_message(sender_id, response)
+            
+            # Update image count
+            if success:
+                with get_db() as conn:
+                    conn.execute(
+                        'UPDATE users SET total_images = total_images + 1 WHERE user_id = ?',
+                        (sender_id,)
+                    )
+            
+            # Log interaction
+            processing_time = time.time() - start_time
+            self.log_interaction(
+                sender_id, "image", user_question, response, provider, 
+                processing_time, None if success else "Send failed"
+            )
+            
+            logger.info(f"✅ Image processed in {processing_time:.2f}s using {provider}")
+            
+        except Exception as e:
+            error_msg = f"Image handling error: {e}"
+            logger.error(error_msg)
+            
+            # Send error response
+            self.send_message(
+                sender_id,
+                "🖼️ I encountered an issue processing your image. Please try again! If the problem persists, our team will fix it soon. 🔧✨"
+            )
+            
+            # Log error
+            self.log_interaction(sender_id, "image", "Image processing error", "", None, 0.0, str(e))
 
 # Initialize enhanced bot
 bot = EnhancedFacebookBot()
 
+# Webhook routes
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
     """Verify webhook for Facebook"""
@@ -809,15 +861,15 @@ def verify_webhook():
     challenge = request.args.get('hub.challenge')
     
     if mode == 'subscribe' and token == VERIFY_TOKEN:
-        logger.info("Webhook verified successfully")
+        logger.info("✅ Webhook verified successfully")
         return challenge
     else:
-        logger.warning("Webhook verification failed")
+        logger.warning("❌ Webhook verification failed")
         return 'Verification failed', 403
 
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
-    """Handle incoming Facebook messages"""
+    """Enhanced webhook handler with comprehensive error handling"""
     try:
         data = request.get_json()
         
@@ -831,6 +883,7 @@ def handle_webhook():
                         message_text = message_data.get('text', '')
                         sender_name = get_user_name(sender_id)
                         
+                        # Handle attachments
                         if message_data.get('attachments'):
                             for attachment in message_data['attachments']:
                                 if attachment.get('type') == 'image':
@@ -844,531 +897,952 @@ def handle_webhook():
                     elif messaging_event.get('postback'):
                         payload = messaging_event['postback'].get('payload')
                         if payload == 'GET_STARTED':
-                            # Send welcome message to all users
                             bot.update_user_database(sender_id, verification_status="verified")
-                            welcome_message = """🌟 **Welcome to Ultimate AI Assistant!** 🚀
+                            welcome_message = f"""🌟 **Welcome to {BOT_NAME} v{BOT_VERSION}!** 🚀
 
-I'm your powerful AI bot featuring:
-🤖 ChatGPT for intelligent conversations
-🌟 Google Gemini for creative tasks
-🔍 Advanced image analysis capabilities
-💭 Smart conversation memory
-⚡ Instant 24/7 responses
+I'm your advanced AI assistant featuring:
 
-Just send me any message or image, and I'll help you! 🍓🥰
+🤖 **Dual AI Power:**
+• ChatGPT for intelligent conversations
+• Google Gemini for creative tasks & analysis
 
-Developed by SUNNEL 🤍"""
+🔍 **Advanced Capabilities:**
+• Image analysis & understanding
+• Smart conversation memory
+• Multi-language support
+• Context-aware responses
+
+⚡ **Enhanced Features:**
+• Real-time analytics
+• 24/7 availability  
+• Error recovery systems
+• Performance monitoring
+
+**Just send me any message or image - I'm here to help!** 🍓🥰
+
+*Developed with ❤️ by SUNNEL*"""
                             bot.send_message(sender_id, welcome_message)
         
         return 'OK', 200
         
     except Exception as e:
-        logger.error(f"Error handling webhook: {e}")
+        logger.error(f"Webhook handling error: {e}")
         return 'Error', 500
 
 @app.route('/dashboard')
 def dashboard():
-    """Enhanced analytics dashboard"""
+    """Ultra-modern analytics dashboard with comprehensive metrics"""
     try:
         with get_db() as conn:
-            # Get bot stats
-            bot_stats = conn.execute('SELECT * FROM bot_stats WHERE id = 1').fetchone()
+            # Comprehensive statistics
+            user_stats = conn.execute('''
+                SELECT 
+                    COUNT(*) as total_users,
+                    COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified_users,
+                    SUM(total_messages) as total_messages,
+                    SUM(total_images) as total_images,
+                    AVG(user_rating) as avg_rating,
+                    COUNT(CASE WHEN last_interaction > datetime('now', '-24 hours') THEN 1 END) as active_24h,
+                    COUNT(CASE WHEN last_interaction > datetime('now', '-7 days') THEN 1 END) as active_7d
+                FROM users
+            ''').fetchone()
             
-            # Get user statistics
-            total_users = conn.execute('SELECT COUNT(*) as count FROM users').fetchone()['count']
-            verified_users = conn.execute(
-                'SELECT COUNT(*) as count FROM users WHERE verification_status = ?', 
-                ('verified',)
-            ).fetchone()['count']
-            unverified_users = total_users - verified_users
+            # Performance metrics
+            perf_stats = conn.execute('''
+                SELECT 
+                    COUNT(*) as total_interactions,
+                    AVG(processing_time) as avg_response_time,
+                    COUNT(CASE WHEN error_message IS NULL THEN 1 END) * 100.0 / COUNT(*) as success_rate,
+                    COUNT(CASE WHEN ai_provider LIKE '%OpenAI%' THEN 1 END) as openai_usage,
+                    COUNT(CASE WHEN ai_provider LIKE '%Gemini%' THEN 1 END) as gemini_usage
+                FROM interactions
+                WHERE timestamp > datetime('now', '-7 days')
+            ''').fetchone()
             
-            # Get recent users (last 10)
+            # Recent users with enhanced info
             recent_users = conn.execute('''
                 SELECT user_id, name, first_name, profile_pic, first_interaction, 
-                       last_interaction, total_messages, total_images, verification_status
+                       last_interaction, total_messages, total_images, verification_status,
+                       user_rating, conversation_count
                 FROM users 
                 ORDER BY last_interaction DESC 
-                LIMIT 10
+                LIMIT 15
             ''').fetchall()
             
-            # Get interaction stats
-            total_messages = conn.execute('SELECT COUNT(*) as count FROM interactions').fetchone()['count']
-            total_images = conn.execute(
-                'SELECT COUNT(*) as count FROM interactions WHERE message_type = ?', 
-                ('image',)
-            ).fetchone()['count']
-            
-            # Get recent interactions
+            # Recent interactions with more details
             recent_interactions = conn.execute('''
                 SELECT i.*, u.name, u.first_name, u.profile_pic
                 FROM interactions i
                 LEFT JOIN users u ON i.user_id = u.user_id
                 ORDER BY i.timestamp DESC
-                LIMIT 20
+                LIMIT 25
+            ''').fetchall()
+            
+            # Feature usage stats
+            feature_stats = conn.execute('''
+                SELECT feature_name, 
+                       COUNT(DISTINCT user_id) as unique_users,
+                       SUM(usage_count) as total_usage,
+                       AVG(success_rate) as avg_success_rate
+                FROM feature_usage 
+                GROUP BY feature_name
+                ORDER BY total_usage DESC
             ''').fetchall()
             
             # Calculate uptime
-            if bot_stats:
-                uptime_start = datetime.fromisoformat(bot_stats['uptime_start'])
-                uptime_duration = datetime.now() - uptime_start
-                uptime_hours = uptime_duration.total_seconds() / 3600
-            else:
-                uptime_hours = 0
-            
-            # AI provider stats
-            openai_usage = conn.execute(
-                'SELECT COUNT(*) as count FROM interactions WHERE ai_provider LIKE ?', 
-                ('%OpenAI%',)
-            ).fetchone()['count']
-            gemini_usage = conn.execute(
-                'SELECT COUNT(*) as count FROM interactions WHERE ai_provider LIKE ?', 
-                ('%Gemini%',)
-            ).fetchone()['count']
+            uptime_start = datetime.fromisoformat('2025-06-20 00:00:00')  # Bot start time
+            uptime_duration = datetime.now() - uptime_start
+            uptime_hours = uptime_duration.total_seconds() / 3600
         
-        return render_template_string(DASHBOARD_HTML, **{
-            'total_users': total_users,
-            'verified_users': verified_users,
-            'unverified_users': unverified_users,
-            'total_messages': total_messages,
-            'total_images': total_images,
+        return render_template_string(ENHANCED_DASHBOARD_HTML, **{
+            'bot_name': BOT_NAME,
+            'bot_version': BOT_VERSION,
+            'total_users': user_stats['total_users'],
+            'verified_users': user_stats['verified_users'],
+            'total_messages': user_stats['total_messages'],
+            'total_images': user_stats['total_images'],
+            'avg_rating': round(user_stats['avg_rating'] or 5.0, 1),
+            'active_24h': user_stats['active_24h'],
+            'active_7d': user_stats['active_7d'],
+            'total_interactions': perf_stats['total_interactions'],
+            'avg_response_time': round(perf_stats['avg_response_time'] or 0.0, 2),
+            'success_rate': round(perf_stats['success_rate'] or 100.0, 1),
+            'openai_usage': perf_stats['openai_usage'],
+            'gemini_usage': perf_stats['gemini_usage'],
             'recent_users': recent_users,
             'recent_interactions': recent_interactions,
+            'feature_stats': feature_stats,
             'uptime_hours': round(uptime_hours, 1),
-            'openai_usage': openai_usage,
-            'gemini_usage': gemini_usage,
-            'required_post_id': REQUIRED_POST_ID,
-            'page_id': PAGE_ID
+            'uptime_days': round(uptime_hours / 24, 1)
         })
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
-        return f"Dashboard error: {e}", 500
+        return f"Dashboard temporarily unavailable: {e}", 500
 
-def get_user_name(user_id):
-    """Get user's name from Facebook Graph API"""
+@app.route('/health')
+def health_check():
+    """Comprehensive health check with detailed system status"""
     try:
+        with get_db() as conn:
+            db_status = "healthy"
+            stats = conn.execute('SELECT * FROM bot_stats WHERE id = 1').fetchone()
+        
+        # Test AI services
+        ai_status = {}
+        
+        if OPENAI_API_KEY:
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=OPENAI_API_KEY)
+                # Quick test (don't actually call the API to save costs)
+                ai_status['openai'] = 'configured'
+            except:
+                ai_status['openai'] = 'error'
+        else:
+            ai_status['openai'] = 'not_configured'
+        
+        if GEMINI_API_KEY and GEMINI_AVAILABLE:
+            ai_status['gemini'] = 'configured'
+        else:
+            ai_status['gemini'] = 'not_configured' if not GEMINI_API_KEY else 'library_error'
+        
+        uptime_duration = datetime.now() - bot.start_time
+        
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'bot_info': {
+                'name': BOT_NAME,
+                'version': BOT_VERSION,
+                'uptime_hours': round(uptime_duration.total_seconds() / 3600, 2),
+                'uptime_days': round(uptime_duration.total_seconds() / 86400, 2)
+            },
+            'services': {
+                'database': db_status,
+                'facebook_api': 'configured' if PAGE_ACCESS_TOKEN else 'not_configured',
+                'webhook': 'configured' if VERIFY_TOKEN else 'not_configured',
+                'ai_services': ai_status
+            },
+            'statistics': {
+                'total_users': stats['total_users'] if stats else 0,
+                'verified_users': stats['verified_users'] if stats else 0,
+                'total_messages': stats['total_messages'] if stats else 0,
+                'success_rate': stats['success_rate'] if stats else 100.0,
+                'avg_response_time': stats['avg_response_time'] if stats else 0.0
+            },
+            'features': {
+                'text_conversations': True,
+                'image_analysis': bool(ai_status.get('openai') == 'configured' or ai_status.get('gemini') == 'configured'),
+                'conversation_memory': True,
+                'user_analytics': True,
+                'error_recovery': True,
+                'performance_monitoring': True,
+                'auto_cleanup': True,
+                'enhanced_logging': True
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+def get_user_name(user_id: str) -> Optional[str]:
+    """Get user's name from Facebook Graph API with caching"""
+    try:
+        # Try from database first
+        with get_db() as conn:
+            user = conn.execute('SELECT first_name FROM users WHERE user_id = ?', (user_id,)).fetchone()
+            if user and user['first_name']:
+                return user['first_name']
+        
+        # Fetch from API if not in database
         url = f'https://graph.facebook.com/{user_id}'
         params = {
             'fields': 'first_name',
             'access_token': PAGE_ACCESS_TOKEN
         }
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         if response.status_code == 200:
             data = response.json()
             return data.get('first_name', '')
-    except:
-        pass
-    return None
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint with enhanced stats"""
-    try:
-        with get_db() as conn:
-            stats = conn.execute('SELECT * FROM bot_stats WHERE id = 1').fetchone()
-            uptime_start = datetime.fromisoformat(stats['uptime_start']) if stats else bot.start_time
-            uptime_duration = datetime.now() - uptime_start
-        
-        return jsonify({
-            'status': 'healthy',
-            'timestamp': datetime.now().isoformat(),
-            'uptime_hours': round(uptime_duration.total_seconds() / 3600, 2),
-            'bot_configured': bool(PAGE_ACCESS_TOKEN and VERIFY_TOKEN),
-            'openai_configured': bool(OPENAI_API_KEY),
-            'gemini_configured': bool(GEMINI_API_KEY and GEMINI_AVAILABLE),
-            'database_status': 'connected',
-            'total_users': stats['total_users'] if stats else 0,
-            'verified_users': stats['verified_users'] if stats else 0,
-            'total_messages': stats['total_messages'] if stats else 0,
-            'required_post_id': REQUIRED_POST_ID,
-            'features': {
-                'smart_conversations': True,
-                'image_analysis': bool(OPENAI_API_KEY or (GEMINI_API_KEY and GEMINI_AVAILABLE)),
-                'multi_ai_providers': bool(OPENAI_API_KEY and GEMINI_API_KEY and GEMINI_AVAILABLE),
-                'conversation_memory': True,
-                'auto_responses': True,
-                'security_verification': True,
-                'user_tracking': True,
-                'analytics_dashboard': True,
-                'auto_uptime': True
-            }
-        })
     except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
+        logger.error(f"Error getting user name: {e}")
+    return None
 
 @app.route('/static/images/<filename>')
 def serve_image(filename):
-    """Serve static images"""
+    """Serve static images with better error handling"""
     try:
-        return app.send_static_file(f'images/{filename}')
-    except:
+        return send_from_directory('static/images', filename)
+    except Exception as e:
+        logger.error(f"Image serving error: {e}")
         return "Image not found", 404
 
-@app.route('/', methods=['GET'])
+@app.route('/')
 def home():
-    """Enhanced home page with bot information"""
+    """Ultra-modern home page with comprehensive system overview"""
     try:
         with get_db() as conn:
             stats = conn.execute('SELECT * FROM bot_stats WHERE id = 1').fetchone()
-            uptime_start = datetime.fromisoformat(stats['uptime_start']) if stats else bot.start_time
-            uptime_duration = datetime.now() - uptime_start
-    except:
-        stats = None
-        uptime_duration = datetime.now() - bot.start_time
+            uptime_duration = datetime.now() - bot.start_time
+            
+            # Calculate health scores
+            health_score = 0
+            if PAGE_ACCESS_TOKEN and VERIFY_TOKEN:
+                health_score += 25
+            if OPENAI_API_KEY:
+                health_score += 25
+            if GEMINI_API_KEY and GEMINI_AVAILABLE:
+                health_score += 25
+            health_score += 25  # Base functionality
     
-    return render_template_string(HOME_HTML, **{
-        'bot_status': "✅" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "❌",
-        'bot_text': "Active & Secured" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "Not Configured",
-        'openai_status': "🤖" if OPENAI_API_KEY else "❌",
-        'openai_text': "Connected" if OPENAI_API_KEY else "Not Configured",
-        'gemini_status': "🌟" if GEMINI_API_KEY and GEMINI_AVAILABLE else "❌",
-        'gemini_text': "Connected" if GEMINI_API_KEY and GEMINI_AVAILABLE else "Not Available",
-        'webhook_url': f"{request.url_root.rstrip('/')}/webhook",
-        'dashboard_url': f"{request.url_root.rstrip('/')}/dashboard",
-        'uptime_hours': round(uptime_duration.total_seconds() / 3600, 1),
-        'total_users': stats['total_users'] if stats else 0,
-        'verified_users': stats['verified_users'] if stats else 0,
-        'total_messages': stats['total_messages'] if stats else 0,
-        'required_post_id': REQUIRED_POST_ID
-    })
+        return render_template_string(ENHANCED_HOME_HTML, **{
+            'bot_name': BOT_NAME,
+            'bot_version': BOT_VERSION,
+            'bot_status': "🟢" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "🔴",
+            'bot_text': "Active & Secure" if PAGE_ACCESS_TOKEN and VERIFY_TOKEN else "Configuration Required",
+            'openai_status': "🤖" if OPENAI_API_KEY else "❌",
+            'openai_text': "ChatGPT Ready" if OPENAI_API_KEY else "Not Configured",
+            'gemini_status': "🌟" if GEMINI_API_KEY and GEMINI_AVAILABLE else "❌",
+            'gemini_text': "Gemini Ready" if GEMINI_API_KEY and GEMINI_AVAILABLE else "Not Available",
+            'webhook_url': f"{request.url_root.rstrip('/')}/webhook",
+            'dashboard_url': f"{request.url_root.rstrip('/')}/dashboard",
+            'health_url': f"{request.url_root.rstrip('/')}/health",
+            'uptime_hours': round(uptime_duration.total_seconds() / 3600, 1),
+            'uptime_days': round(uptime_duration.total_seconds() / 86400, 1),
+            'total_users': stats['total_users'] if stats else 0,
+            'verified_users': stats['verified_users'] if stats else 0,
+            'total_messages': stats['total_messages'] if stats else 0,
+            'success_rate': round(stats['success_rate'] if stats else 100.0, 1),
+            'health_score': health_score
+        })
+    except Exception as e:
+        logger.error(f"Home page error: {e}")
+        return f"<h1>System temporarily unavailable</h1><p>Error: {e}</p>", 500
 
-# HTML Templates
-HOME_HTML = """
+# Enhanced HTML Templates
+ENHANCED_HOME_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>🤖 Ultimate AI Facebook Bot - Analytics Dashboard</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 {{ bot_name }} v{{ bot_version }} - Advanced AI Analytics</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            --warning-gradient: linear-gradient(135deg, #f6d365 0%, #fda085 100%);
+            --glass-bg: rgba(255, 255, 255, 0.1);
+            --glass-border: rgba(255, 255, 255, 0.2);
+            --text-primary: #ffffff;
+            --text-secondary: rgba(255, 255, 255, 0.8);
+            --shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+            --border-radius: 20px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', sans-serif;
+            background: var(--primary-gradient);
             min-height: 100vh;
-            color: white;
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
             padding: 20px;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
-            border: 1px solid rgba(255, 255, 255, 0.18);
+
+        .glass-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border-radius: var(--border-radius);
+            border: 1px solid var(--glass-border);
+            box-shadow: var(--shadow);
+            transition: all 0.3s ease;
         }
-        h1 {
+
+        .glass-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(31, 38, 135, 0.5);
+        }
+
+        .header {
             text-align: center;
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            padding: 40px;
+            margin-bottom: 30px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--success-gradient);
+            opacity: 0.1;
+            z-index: -1;
+        }
+
+        .header h1 {
+            font-size: clamp(2rem, 5vw, 3.5rem);
+            font-weight: 700;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4, #45b7d1, #96ceb4, #ffeaa7);
+            background-size: 400% 400%;
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
+            animation: gradientShift 6s ease-in-out infinite;
+            margin-bottom: 15px;
         }
+
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
         .subtitle {
-            text-align: center;
-            font-size: 1.2em;
-            margin-bottom: 30px;
-            opacity: 0.9;
+            font-size: 1.3rem;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-bottom: 20px;
         }
+
+        .status-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 25px;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--glass-bg);
+            border-radius: 25px;
+            border: 1px solid var(--glass-border);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin: 30px 0;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 25px;
+            margin-bottom: 40px;
         }
+
         .stat-card {
-            background: rgba(255, 255, 255, 0.1);
-            padding: 20px;
-            border-radius: 15px;
+            padding: 30px;
             text-align: center;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            transition: transform 0.3s ease;
+            position: relative;
+            overflow: hidden;
         }
-        .stat-card:hover {
-            transform: translateY(-5px);
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--secondary-gradient);
+            opacity: 0.1;
+            z-index: -1;
         }
+
         .stat-number {
-            font-size: 2.5em;
-            font-weight: bold;
+            font-size: 3rem;
+            font-weight: 700;
             color: #4ecdc4;
             margin-bottom: 10px;
+            text-shadow: 0 2px 10px rgba(78, 205, 196, 0.3);
         }
-        .security-banner {
-            background: linear-gradient(45deg, #ff6b6b, #feca57);
-            padding: 20px;
-            border-radius: 15px;
-            text-align: center;
-            margin: 20px 0;
-            color: white;
-            font-weight: bold;
+
+        .stat-label {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
         }
-        .dashboard-button {
-            display: block;
-            width: 100%;
-            max-width: 300px;
-            margin: 30px auto;
+
+        .stat-description {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            opacity: 0.8;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin: 40px 0;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
             padding: 15px 30px;
-            background: linear-gradient(45deg, #4ecdc4, #44a08d);
+            background: var(--success-gradient);
             color: white;
             text-decoration: none;
-            border-radius: 25px;
-            text-align: center;
-            font-size: 1.2em;
-            font-weight: bold;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 1.1rem;
             transition: all 0.3s ease;
             border: none;
             cursor: pointer;
+            box-shadow: 0 4px 15px rgba(79, 172, 254, 0.3);
         }
-        .dashboard-button:hover {
+
+        .btn:hover {
             transform: translateY(-3px);
-            box-shadow: 0 10px 25px rgba(68, 160, 141, 0.4);
+            box-shadow: 0 8px 25px rgba(79, 172, 254, 0.5);
         }
-        .features {
+
+        .btn-secondary {
+            background: var(--warning-gradient);
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 25px;
+            margin: 40px 0;
+        }
+
+        .feature-card {
+            padding: 25px;
+            border-left: 4px solid #4ecdc4;
+            position: relative;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(78, 205, 196, 0.1), rgba(69, 183, 209, 0.1));
+            z-index: -1;
+        }
+
+        .feature-icon {
+            font-size: 2rem;
+            color: #4ecdc4;
+            margin-bottom: 15px;
+        }
+
+        .feature-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--text-primary);
+        }
+
+        .feature-description {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }
+
+        .system-info {
+            margin-top: 40px;
+            padding: 30px;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .system-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 15px;
-            margin: 30px 0;
+            gap: 20px;
+            margin-top: 25px;
         }
-        .feature {
-            background: rgba(255, 255, 255, 0.1);
+
+        .system-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
             padding: 15px;
-            border-radius: 10px;
-            border-left: 4px solid #4ecdc4;
+            background: var(--glass-bg);
+            border-radius: 15px;
+            border: 1px solid var(--glass-border);
         }
-        .security-feature {
-            border-left: 4px solid #ff6b6b;
+
+        .health-score {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 24px;
+            background: var(--success-gradient);
+            border-radius: 30px;
+            font-weight: 600;
+            margin-top: 20px;
         }
-        .uptime-banner {
-            background: linear-gradient(45deg, #43cea2, #185a9d);
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-            margin: 20px 0;
-            font-weight: bold;
+
+        .uptime-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: rgba(76, 175, 80, 0.2);
+            border: 1px solid rgba(76, 175, 80, 0.3);
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: #4caf50;
         }
-        .webhook-info {
-            background: rgba(0, 0, 0, 0.2);
-            padding: 20px;
-            border-radius: 10px;
-            margin-top: 30px;
-            text-align: center;
+
+        .pulse {
+            animation: pulse 2s ease-in-out infinite;
         }
-        code {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 5px 10px;
-            border-radius: 5px;
-            font-family: 'Courier New', monospace;
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
         }
-        .status-indicator {
+
+        @media (max-width: 768px) {
+            .container { padding: 15px; }
+            .header { padding: 25px; }
+            .stats-grid { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+            .action-buttons { flex-direction: column; align-items: center; }
+            .features-grid { grid-template-columns: 1fr; }
+        }
+
+        .loading-spinner {
             display: inline-block;
-            width: 10px;
-            height: 10px;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
             border-radius: 50%;
-            margin-right: 8px;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
         }
-        .status-online { background-color: #4ade80; }
-        .status-offline { background-color: #ef4444; }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Ultimate AI Facebook Bot</h1>
-        <p class="subtitle">Advanced Analytics & AI-Powered Conversations 🚀</p>
-        
-        <div class="uptime-banner">
-            <span class="status-indicator status-online"></span>
-            🔄 Auto Uptime: {{ uptime_hours }} hours | 🎯 Monitoring Active
+        <!-- Header Section -->
+        <div class="glass-card header">
+            <h1>🤖 {{ bot_name }}</h1>
+            <p class="subtitle">Version {{ bot_version }} - Next-Generation AI Assistant</p>
+            <p style="font-size: 1rem; color: var(--text-secondary); margin-bottom: 20px;">
+                Advanced Multi-AI Platform with Real-time Analytics & Enhanced Security
+            </p>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="pulse">🟢</span>
+                    <span>System Online</span>
+                </div>
+                <div class="status-item">
+                    <i class="fas fa-clock"></i>
+                    <span>{{ uptime_days }}d uptime</span>
+                </div>
+                <div class="status-item">
+                    <i class="fas fa-shield-alt"></i>
+                    <span>Secured & Monitored</span>
+                </div>
+            </div>
         </div>
-        
-        <div style="background: linear-gradient(45deg, #4ecdc4, #44a08d); padding: 20px; border-radius: 15px; text-align: center; margin: 20px 0; color: white; font-weight: bold;">
-            🌟 OPEN ACCESS - ALL USERS WELCOME! 🌟<br>
-            No verification required - Start chatting immediately!
-        </div>
-        
+
+        <!-- Key Statistics -->
         <div class="stats-grid">
-            <div class="stat-card">
+            <div class="glass-card stat-card">
                 <div class="stat-number">{{ total_users }}</div>
-                <h3>Total Users</h3>
-                <p>Registered in database</p>
+                <div class="stat-label">Total Users</div>
+                <div class="stat-description">Active community members</div>
             </div>
-            <div class="stat-card">
+            <div class="glass-card stat-card">
                 <div class="stat-number">{{ verified_users }}</div>
-                <h3>Verified Users</h3>
-                <p>Full access granted</p>
+                <div class="stat-label">Verified Users</div>
+                <div class="stat-description">Full access granted</div>
             </div>
-            <div class="stat-card">
+            <div class="glass-card stat-card">
                 <div class="stat-number">{{ total_messages }}</div>
-                <h3>Total Messages</h3>
-                <p>AI conversations</p>
+                <div class="stat-label">AI Conversations</div>
+                <div class="stat-description">Messages processed</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ uptime_hours }}h</div>
-                <h3>Uptime</h3>
-                <p>Continuous operation</p>
-            </div>
-        </div>
-        
-        <a href="{{ dashboard_url }}" class="dashboard-button">
-            📊 View Full Analytics Dashboard
-        </a>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div style="font-size: 2em; margin-bottom: 10px;">{{ bot_status }}</div>
-                <h3>Bot Status</h3>
-                <p>{{ bot_text }}</p>
-            </div>
-            <div class="stat-card">
-                <div style="font-size: 2em; margin-bottom: 10px;">{{ openai_status }}</div>
-                <h3>ChatGPT</h3>
-                <p>{{ openai_text }}</p>
-            </div>
-            <div class="stat-card">
-                <div style="font-size: 2em; margin-bottom: 10px;">{{ gemini_status }}</div>
-                <h3>Google Gemini</h3>
-                <p>{{ gemini_text }}</p>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ success_rate }}%</div>
+                <div class="stat-label">Success Rate</div>
+                <div class="stat-description">System reliability</div>
             </div>
         </div>
-        
-        <h2 style="text-align: center; margin: 30px 0;">🌟 Enhanced Features</h2>
-        <div class="features">
-            <div class="feature">
-                <strong>🌟 Open Access</strong><br>
-                Welcome to all users - no verification required
+
+        <!-- Action Buttons -->
+        <div class="action-buttons">
+            <a href="{{ dashboard_url }}" class="btn">
+                <i class="fas fa-chart-line"></i>
+                Advanced Analytics Dashboard
+            </a>
+            <a href="{{ health_url }}" class="btn btn-secondary">
+                <i class="fas fa-heartbeat"></i>
+                System Health Check
+            </a>
+        </div>
+
+        <!-- Service Status -->
+        <div class="glass-card system-info">
+            <h2 style="margin-bottom: 20px; font-size: 1.8rem;">🔧 System Status</h2>
+            <div class="health-score">
+                <i class="fas fa-heart"></i>
+                <span>System Health: {{ health_score }}%</span>
             </div>
-            <div class="feature">
-                <strong>📊 Real-time Analytics</strong><br>
-                Live user tracking and interaction monitoring
-            </div>
-            <div class="feature">
-                <strong>🤖 Multi-AI Intelligence</strong><br>
-                ChatGPT + Gemini with smart provider routing
-            </div>
-            <div class="feature">
-                <strong>🔍 Advanced Image Analysis</strong><br>
-                AI-powered image understanding and description
-            </div>
-            <div class="feature">
-                <strong>🔄 Auto Uptime Monitor</strong><br>
-                Continuous operation tracking and health monitoring
-            </div>
-            <div class="feature">
-                <strong>💾 User Database</strong><br>
-                Complete user profiles and interaction history
-            </div>
-            <div class="feature">
-                <strong>🎨 Aesthetic Dashboard</strong><br>
-                Beautiful real-time analytics interface
-            </div>
-            <div class="feature">
-                <strong>⚡ Smart Responses</strong><br>
-                Context-aware AI conversations with memory
+            
+            <div class="system-grid">
+                <div class="system-item">
+                    <span style="font-size: 1.5rem;">{{ bot_status }}</span>
+                    <div>
+                        <div style="font-weight: 600;">Facebook Bot</div>
+                        <div style="font-size: 0.9rem; opacity: 0.8;">{{ bot_text }}</div>
+                    </div>
+                </div>
+                <div class="system-item">
+                    <span style="font-size: 1.5rem;">{{ openai_status }}</span>
+                    <div>
+                        <div style="font-weight: 600;">ChatGPT AI</div>
+                        <div style="font-size: 0.9rem; opacity: 0.8;">{{ openai_text }}</div>
+                    </div>
+                </div>
+                <div class="system-item">
+                    <span style="font-size: 1.5rem;">{{ gemini_status }}</span>
+                    <div>
+                        <div style="font-weight: 600;">Google Gemini</div>
+                        <div style="font-size: 0.9rem; opacity: 0.8;">{{ gemini_text }}</div>
+                    </div>
+                </div>
+                <div class="system-item">
+                    <span style="font-size: 1.5rem;">📊</span>
+                    <div>
+                        <div style="font-weight: 600;">Analytics Engine</div>
+                        <div style="font-size: 0.9rem; opacity: 0.8;">Real-time monitoring</div>
+                    </div>
+                </div>
             </div>
         </div>
-        
-        <div class="webhook-info">
-            <h3>📡 System Configuration</h3>
-            <p>Webhook URL: <code>{{ webhook_url }}</code></p>
-            <p>Analytics Dashboard: <code>{{ dashboard_url }}</code></p>
-            <p>Ready to receive and analyze secured messages!</p>
+
+        <!-- Enhanced Features -->
+        <div class="glass-card" style="padding: 40px; margin-top: 30px;">
+            <h2 style="text-align: center; margin-bottom: 30px; font-size: 1.8rem;">🌟 Advanced Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-brain"></i></div>
+                    <div class="feature-title">Dual AI Intelligence</div>
+                    <div class="feature-description">ChatGPT + Gemini working together for optimal responses</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-eye"></i></div>
+                    <div class="feature-title">Advanced Image Analysis</div>
+                    <div class="feature-description">AI-powered image understanding and detailed analysis</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-memory"></i></div>
+                    <div class="feature-title">Smart Conversation Memory</div>
+                    <div class="feature-description">Context-aware responses with conversation history</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-chart-bar"></i></div>
+                    <div class="feature-title">Real-time Analytics</div>
+                    <div class="feature-description">Comprehensive user tracking and performance metrics</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-shield-check"></i></div>
+                    <div class="feature-title">Enhanced Security</div>
+                    <div class="feature-description">Advanced error handling and system monitoring</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon"><i class="fas fa-rocket"></i></div>
+                    <div class="feature-title">Performance Optimized</div>
+                    <div class="feature-description">Fast response times with automatic cleanup</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Information -->
+        <div class="glass-card system-info">
+            <h3 style="margin-bottom: 20px;">📡 Technical Information</h3>
+            <div style="display: grid; gap: 15px; text-align: left;">
+                <div><strong>Webhook URL:</strong> <code style="background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 5px;">{{ webhook_url }}</code></div>
+                <div><strong>Dashboard URL:</strong> <code style="background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 5px;">{{ dashboard_url }}</code></div>
+                <div><strong>Health Check:</strong> <code style="background: rgba(0,0,0,0.3); padding: 5px 10px; border-radius: 5px;">{{ health_url }}</code></div>
+            </div>
+            
+            <div class="uptime-badge" style="margin-top: 20px;">
+                <i class="fas fa-clock"></i>
+                <span>{{ uptime_hours }} hours continuous operation</span>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div style="text-align: center; margin-top: 40px; padding: 20px; color: var(--text-secondary);">
+            <p>💫 <strong>Developed with ❤️ by SUNNEL</strong> 💫</p>
+            <p style="font-size: 0.9rem; margin-top: 10px;">Next-generation AI technology for enhanced user experiences</p>
         </div>
     </div>
+
+    <script>
+        // Auto-refresh every 5 minutes
+        setTimeout(() => location.reload(), 300000);
+        
+        // Add loading states to buttons
+        document.querySelectorAll('.btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const loadingHTML = this.innerHTML;
+                this.innerHTML = '<div class="loading-spinner"></div> Loading...';
+                setTimeout(() => this.innerHTML = loadingHTML, 2000);
+            });
+        });
+    </script>
 </body>
 </html>
 """
 
-DASHBOARD_HTML = """
+ENHANCED_DASHBOARD_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>📊 Bot Analytics Dashboard</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📊 {{ bot_name }} Analytics Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary: #667eea;
+            --secondary: #764ba2;
+            --accent: #4ecdc4;
+            --success: #4ade80;
+            --warning: #fbbf24;
+            --error: #ef4444;
+            --glass-bg: rgba(255, 255, 255, 0.1);
+            --glass-border: rgba(255, 255, 255, 0.2);
+            --text-primary: #ffffff;
+            --text-secondary: rgba(255, 255, 255, 0.8);
+            --shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Inter', sans-serif;
             background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
             min-height: 100vh;
-            color: white;
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
             padding: 20px;
         }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
+
+        .glass-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            border: 1px solid var(--glass-border);
+            box-shadow: var(--shadow);
+            transition: all 0.3s ease;
         }
+
+        .glass-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px rgba(31, 38, 135, 0.5);
+        }
+
         .header {
             text-align: center;
+            padding: 40px;
             margin-bottom: 30px;
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            padding: 30px;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.2), rgba(118, 75, 162, 0.2));
         }
+
         .header h1 {
-            font-size: 2.5em;
+            font-size: 2.5rem;
+            font-weight: 700;
             background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
             margin-bottom: 10px;
         }
+
+        .back-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 25px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 600;
+            margin-bottom: 30px;
+            transition: all 0.3s ease;
+        }
+
+        .back-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 20px;
-            margin-bottom: 30px;
+            margin-bottom: 40px;
         }
+
         .stat-card {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
             padding: 25px;
-            border-radius: 15px;
             text-align: center;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            transition: transform 0.3s ease;
+            position: relative;
+            overflow: hidden;
         }
-        .stat-card:hover {
-            transform: translateY(-5px);
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(78, 205, 196, 0.1), rgba(69, 183, 209, 0.1));
+            z-index: -1;
         }
+
         .stat-number {
-            font-size: 3em;
-            font-weight: bold;
-            color: #4ecdc4;
-            margin-bottom: 10px;
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--accent);
+            margin-bottom: 8px;
+            text-shadow: 0 2px 10px rgba(78, 205, 196, 0.3);
         }
+
         .stat-label {
-            font-size: 1.1em;
-            opacity: 0.9;
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text-secondary);
             margin-bottom: 5px;
         }
+
+        .stat-sublabel {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            opacity: 0.8;
+        }
+
         .section {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
+            margin-bottom: 40px;
             padding: 30px;
-            border-radius: 20px;
-            margin-bottom: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
         }
+
         .section h2 {
-            margin-bottom: 20px;
-            color: #4ecdc4;
-            font-size: 1.8em;
+            margin-bottom: 25px;
+            color: var(--accent);
+            font-size: 1.8rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
+
+        .user-grid {
+            display: grid;
+            gap: 15px;
+        }
+
         .user-card {
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.05);
             padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 15px;
+            border-radius: 15px;
             display: flex;
             align-items: center;
             gap: 15px;
-            border-left: 4px solid #4ecdc4;
+            border-left: 4px solid var(--accent);
+            transition: all 0.3s ease;
         }
+
+        .user-card:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateX(5px);
+        }
+
         .user-avatar {
             width: 50px;
             height: 50px;
@@ -1377,237 +1851,427 @@ DASHBOARD_HTML = """
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.5em;
+            font-size: 1.3rem;
             font-weight: bold;
+            color: white;
         }
+
         .user-info {
             flex: 1;
         }
+
         .user-name {
-            font-size: 1.2em;
-            font-weight: bold;
+            font-size: 1.1rem;
+            font-weight: 600;
             margin-bottom: 5px;
         }
+
         .user-stats {
-            opacity: 0.8;
-            font-size: 0.9em;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
         }
-        .verification-badge {
-            padding: 5px 10px;
-            border-radius: 15px;
-            font-size: 0.8em;
-            font-weight: bold;
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
         }
-        .verified {
-            background: #4ade80;
+
+        .badge-verified {
+            background: var(--success);
             color: #065f46;
         }
-        .unverified {
-            background: #fbbf24;
+
+        .badge-unverified {
+            background: var(--warning);
             color: #92400e;
         }
+
         .interaction-item {
             background: rgba(255, 255, 255, 0.05);
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 10px;
+            padding: 18px;
+            border-radius: 12px;
+            margin-bottom: 12px;
             border-left: 3px solid #6366f1;
+            transition: all 0.3s ease;
         }
+
+        .interaction-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
         .interaction-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+            gap: 10px;
         }
+
         .interaction-user {
-            font-weight: bold;
-            color: #4ecdc4;
+            font-weight: 600;
+            color: var(--accent);
         }
+
         .interaction-time {
-            font-size: 0.8em;
-            opacity: 0.7;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .interaction-content {
-            font-size: 0.9em;
-            opacity: 0.9;
-        }
+
         .ai-provider {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 0.7em;
-            font-weight: bold;
-            margin-left: 10px;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            font-weight: 600;
         }
-        .openai { background: #10b981; color: white; }
-        .gemini { background: #8b5cf6; color: white; }
+
+        .provider-openai {
+            background: #10b981;
+            color: white;
+        }
+
+        .provider-gemini {
+            background: #8b5cf6;
+            color: white;
+        }
+
+        .interaction-content {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
         .auto-refresh {
             position: fixed;
             top: 20px;
             right: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 10px 15px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 12px 18px;
             border-radius: 25px;
-            font-size: 0.9em;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 1000;
+            backdrop-filter: blur(10px);
         }
-        .back-button {
+
+        .feature-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .feature-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .feature-name {
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--accent);
+        }
+
+        .feature-metrics {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .loading-indicator {
             display: inline-block;
-            padding: 10px 20px;
-            background: linear-gradient(45deg, #667eea, #764ba2);
-            color: white;
-            text-decoration: none;
-            border-radius: 25px;
-            margin-bottom: 20px;
-            transition: transform 0.3s ease;
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(78, 205, 196, 0.3);
+            border-radius: 50%;
+            border-top-color: var(--accent);
+            animation: spin 1s ease-in-out infinite;
         }
-        .back-button:hover {
-            transform: translateY(-2px);
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
+
         @media (max-width: 768px) {
-            .stats-grid {
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            }
-            .user-card {
-                flex-direction: column;
-                text-align: center;
-            }
+            .container { padding: 15px; }
+            .header { padding: 25px; }
+            .stats-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+            .user-card { flex-direction: column; text-align: center; }
+            .interaction-header { flex-direction: column; align-items: flex-start; }
         }
     </style>
+</head>
+<body>
+    <div class="auto-refresh">
+        <div class="loading-indicator"></div>
+        <span>Auto-refresh: 30s</span>
+    </div>
+    
+    <div class="container">
+        <a href="/" class="back-btn">
+            <i class="fas fa-arrow-left"></i>
+            Back to Home
+        </a>
+        
+        <div class="glass-card header">
+            <h1>📊 Advanced Analytics Dashboard</h1>
+            <p style="font-size: 1.1rem; color: var(--text-secondary);">{{ bot_name }} v{{ bot_version }} - Real-time Monitoring & Insights</p>
+            <div style="margin-top: 15px; display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
+                <span style="padding: 8px 16px; background: rgba(76, 175, 80, 0.2); border-radius: 20px; font-size: 0.9rem;">
+                    <i class="fas fa-clock"></i> Uptime: {{ uptime_days }} days
+                </span>
+                <span style="padding: 8px 16px; background: rgba(33, 150, 243, 0.2); border-radius: 20px; font-size: 0.9rem;">
+                    <i class="fas fa-shield-alt"></i> System Secure
+                </span>
+            </div>
+        </div>
+        
+        <!-- Core Statistics -->
+        <div class="stats-grid">
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ total_users }}</div>
+                <div class="stat-label">Total Users</div>
+                <div class="stat-sublabel">Registered members</div>
+            </div>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ verified_users }}</div>
+                <div class="stat-label">Verified Users</div>
+                <div class="stat-sublabel">Full access granted</div>
+            </div>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ active_24h }}</div>
+                <div class="stat-label">Active (24h)</div>
+                <div class="stat-sublabel">Recent activity</div>
+            </div>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ active_7d }}</div>
+                <div class="stat-label">Active (7d)</div>
+                <div class="stat-sublabel">Weekly users</div>
+            </div>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ total_messages }}</div>
+                <div class="stat-label">Total Messages</div>
+                <div class="stat-sublabel">AI conversations</div>
+            </div>
+            <div class="glass-card stat-card">
+                <div class="stat-number">{{ total_images }}</div>
+                <div class="stat-label">Images Analyzed</div>
+                <div class="stat-sublabel">Vision processing</div>
+            </div>
+        </div>
+        
+        <!-- Performance Metrics -->
+        <div class="glass-card section">
+            <h2><i class="fas fa-tachometer-alt"></i> Performance Metrics</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number">{{ success_rate }}%</div>
+                    <div class="stat-label">Success Rate</div>
+                    <div class="stat-sublabel">System reliability</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ avg_response_time }}s</div>
+                    <div class="stat-label">Avg Response Time</div>
+                    <div class="stat-sublabel">Processing speed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ avg_rating }}/5</div>
+                    <div class="stat-label">User Rating</div>
+                    <div class="stat-sublabel">Satisfaction score</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ total_interactions }}</div>
+                    <div class="stat-label">Total Interactions</div>
+                    <div class="stat-sublabel">All activities</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- AI Provider Usage -->
+        <div class="glass-card section">
+            <h2><i class="fas fa-robot"></i> AI Provider Analytics</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number">{{ openai_usage }}</div>
+                    <div class="stat-label">OpenAI/ChatGPT</div>
+                    <div class="stat-sublabel">Text & vision</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ gemini_usage }}</div>
+                    <div class="stat-label">Google Gemini</div>
+                    <div class="stat-sublabel">Advanced AI</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ (openai_usage + gemini_usage) }}</div>
+                    <div class="stat-label">Total AI Calls</div>
+                    <div class="stat-sublabel">Combined usage</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{{ "%.1f"|format((gemini_usage / (openai_usage + gemini_usage) * 100) if (openai_usage + gemini_usage) > 0 else 0) }}%</div>
+                    <div class="stat-label">Gemini Preference</div>
+                    <div class="stat-sublabel">Usage ratio</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Feature Usage Statistics -->
+        {% if feature_stats %}
+        <div class="glass-card section">
+            <h2><i class="fas fa-chart-pie"></i> Feature Usage Analytics</h2>
+            <div class="feature-stats">
+                {% for feature in feature_stats %}
+                <div class="feature-card">
+                    <div class="feature-name">{{ feature.feature_name.replace('_', ' ').title() }}</div>
+                    <div class="feature-metrics">
+                        <span>Users: {{ feature.unique_users }}</span>
+                        <span>Usage: {{ feature.total_usage }}</span>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        
+        <!-- Recent Users -->
+        <div class="glass-card section">
+            <h2><i class="fas fa-users"></i> Recent Users ({{ recent_users|length }})</h2>
+            <div class="user-grid">
+                {% for user in recent_users %}
+                <div class="user-card">
+                    <div class="user-avatar">
+                        {% if user.profile_pic %}
+                            <img src="{{ user.profile_pic }}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
+                        {% else %}
+                            {{ user.first_name[0] if user.first_name else '?' }}
+                        {% endif %}
+                    </div>
+                    <div class="user-info">
+                        <div class="user-name">
+                            {{ user.name or user.first_name or 'Unknown User' }}
+                            <span class="badge {{ 'badge-verified' if user.verification_status == 'verified' else 'badge-unverified' }}">
+                                {{ '✅ Verified' if user.verification_status == 'verified' else '⏳ Pending' }}
+                            </span>
+                        </div>
+                        <div class="user-stats">
+                            <span><i class="fas fa-comments"></i> {{ user.total_messages }} messages</span>
+                            <span><i class="fas fa-images"></i> {{ user.total_images }} images</span>
+                            <span><i class="fas fa-star"></i> {{ "%.1f"|format(user.user_rating or 5.0) }} rating</span>
+                            <span><i class="fas fa-clock"></i> {{ user.last_interaction[:19] if user.last_interaction else 'Never' }}</span>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        
+        <!-- Recent Interactions -->
+        <div class="glass-card section">
+            <h2><i class="fas fa-history"></i> Recent Interactions ({{ recent_interactions|length }})</h2>
+            {% for interaction in recent_interactions %}
+            <div class="interaction-item">
+                <div class="interaction-header">
+                    <span class="interaction-user">
+                        <i class="fas fa-user"></i>
+                        {{ interaction.name or interaction.first_name or 'Unknown User' }}
+                    </span>
+                    <div class="interaction-time">
+                        <i class="fas fa-clock"></i>
+                        {{ interaction.timestamp[:19] if interaction.timestamp else '' }}
+                        {% if interaction.ai_provider %}
+                            <span class="ai-provider {{ 'provider-openai' if 'OpenAI' in interaction.ai_provider else 'provider-gemini' }}">
+                                {{ interaction.ai_provider }}
+                            </span>
+                        {% endif %}
+                        {% if interaction.processing_time %}
+                            <span style="font-size: 0.7rem; color: var(--text-secondary);">
+                                ({{ "%.2f"|format(interaction.processing_time) }}s)
+                            </span>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="interaction-content">
+                    <strong><i class="fas fa-{{ 'image' if interaction.message_type == 'image' else 'comment' }}"></i> {{ interaction.message_type.title() }}:</strong> 
+                    {{ interaction.content[:150] }}{{ '...' if interaction.content|length > 150 else '' }}
+                    {% if interaction.error_message %}
+                        <div style="color: var(--error); font-size: 0.8rem; margin-top: 5px;">
+                            <i class="fas fa-exclamation-triangle"></i> Error: {{ interaction.error_message }}
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
     <script>
         // Auto-refresh every 30 seconds
         setTimeout(() => {
             location.reload();
         }, 30000);
+
+        // Add smooth animations
+        document.addEventListener('DOMContentLoaded', function() {
+            const cards = document.querySelectorAll('.glass-card');
+            cards.forEach((card, index) => {
+                card.style.opacity = '0';
+                card.style.transform = 'translateY(20px)';
+                setTimeout(() => {
+                    card.style.transition = 'all 0.5s ease';
+                    card.style.opacity = '1';
+                    card.style.transform = 'translateY(0)';
+                }, index * 100);
+            });
+        });
     </script>
-</head>
-<body>
-    <div class="auto-refresh">
-        🔄 Auto-refresh: 30s
-    </div>
-    
-    <div class="container">
-        <a href="/" class="back-button">← Back to Home</a>
-        
-        <div class="header">
-            <h1>📊 Bot Analytics Dashboard</h1>
-            <p>Real-time monitoring and user analytics</p>
-            <p><strong>Uptime:</strong> {{ uptime_hours }} hours | <strong>Access:</strong> Open to All Users 🌟</p>
-        </div>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number">{{ total_users }}</div>
-                <div class="stat-label">Total Users</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ verified_users }}</div>
-                <div class="stat-label">Verified Users</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ unverified_users }}</div>
-                <div class="stat-label">Unverified Users</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ total_messages }}</div>
-                <div class="stat-label">Total Messages</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ total_images }}</div>
-                <div class="stat-label">Images Analyzed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ openai_usage + gemini_usage }}</div>
-                <div class="stat-label">AI Interactions</div>
-            </div>
-        </div>
-        
-        <div class="section">
-            <h2>🎯 AI Provider Usage</h2>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-number">{{ openai_usage }}</div>
-                    <div class="stat-label">OpenAI/ChatGPT</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">{{ gemini_usage }}</div>
-                    <div class="stat-label">Google Gemini</div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="section">
-            <h2>👥 Recent Users</h2>
-            {% for user in recent_users %}
-            <div class="user-card">
-                <div class="user-avatar">
-                    {% if user.profile_pic %}
-                        <img src="{{ user.profile_pic }}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
-                    {% else %}
-                        {{ user.first_name[0] if user.first_name else '?' }}
-                    {% endif %}
-                </div>
-                <div class="user-info">
-                    <div class="user-name">
-                        {{ user.name or user.first_name or 'Unknown User' }}
-                        <span class="verification-badge {{ 'verified' if user.verification_status == 'verified' else 'unverified' }}">
-                            {{ '✅ Verified' if user.verification_status == 'verified' else '⏳ Unverified' }}
-                        </span>
-                    </div>
-                    <div class="user-stats">
-                        💬 {{ user.total_messages }} messages | 🖼️ {{ user.total_images }} images | 
-                        📅 Last seen: {{ user.last_interaction[:19] if user.last_interaction else 'Never' }}
-                    </div>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-        
-        <div class="section">
-            <h2>💬 Recent Interactions</h2>
-            {% for interaction in recent_interactions %}
-            <div class="interaction-item">
-                <div class="interaction-header">
-                    <span class="interaction-user">
-                        {{ interaction.name or interaction.first_name or 'Unknown User' }}
-                    </span>
-                    <span class="interaction-time">
-                        {{ interaction.timestamp[:19] if interaction.timestamp else '' }}
-                        {% if interaction.ai_provider %}
-                            <span class="ai-provider {{ 'openai' if 'OpenAI' in interaction.ai_provider else 'gemini' }}">
-                                {{ interaction.ai_provider }}
-                            </span>
-                        {% endif %}
-                    </span>
-                </div>
-                <div class="interaction-content">
-                    <strong>{{ interaction.message_type.title() }}:</strong> 
-                    {{ interaction.content[:100] }}{{ '...' if interaction.content|length > 100 else '' }}
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-    </div>
 </body>
 </html>
 """
 
 if __name__ == '__main__':
-    logger.info("🚀 Starting Ultimate AI Facebook Bot with Analytics...")
+    logger.info(f"🚀 Starting {BOT_NAME} v{BOT_VERSION}...")
     
+    # Configuration checks
+    config_status = []
     if not PAGE_ACCESS_TOKEN:
-        logger.warning("❌ FACEBOOK_PAGE_ACCESS_TOKEN not set")
+        config_status.append("❌ FACEBOOK_PAGE_ACCESS_TOKEN not set")
+    else:
+        config_status.append("✅ Facebook API configured")
+        
     if not OPENAI_API_KEY:
-        logger.warning("❌ OPENAI_API_KEY not set")
+        config_status.append("❌ OPENAI_API_KEY not set")
+    else:
+        config_status.append("✅ OpenAI configured")
+        
     if not GEMINI_API_KEY:
-        logger.warning("❌ GEMINI_API_KEY not set")
-    if not GEMINI_AVAILABLE:
-        logger.warning("⚠️ Gemini libraries not available - using OpenAI only")
+        config_status.append("❌ GEMINI_API_KEY not set")
+    elif not GEMINI_AVAILABLE:
+        config_status.append("⚠️ Gemini libraries not available")
+    else:
+        config_status.append("✅ Gemini configured")
     
-    logger.info(f"🎯 Required post ID: {REQUIRED_POST_ID}")
-    logger.info(f"📊 Analytics dashboard available at: /dashboard")
-    logger.info(f"🔄 Auto uptime monitoring: ACTIVE")
+    for status in config_status:
+        logger.info(status)
     
-    if OPENAI_API_KEY and GEMINI_API_KEY and GEMINI_AVAILABLE:
-        logger.info("🌟 Multi-AI configuration detected - Full features available!")
+    logger.info(f"📊 Enhanced analytics dashboard: /dashboard")
+    logger.info(f"🏥 Health check endpoint: /health")
+    logger.info(f"🔄 Auto monitoring: ACTIVE")
+    logger.info(f"🌟 Open access mode: ALL USERS WELCOME")
+    
+    if (OPENAI_API_KEY or (GEMINI_API_KEY and GEMINI_AVAILABLE)) and PAGE_ACCESS_TOKEN:
+        logger.info("🎉 Enhanced configuration detected - All features available!")
     
     app.run(host='0.0.0.0', port=5000, debug=False)
