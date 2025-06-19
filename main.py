@@ -15,12 +15,16 @@ import threading
 import sqlite3
 from contextlib import contextmanager
 
-# Only import Gemini if available (fix for grpc error)
+# Import Gemini (simplified approach)
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
 except ImportError as e:
     logging.warning(f"Gemini not available: {e}")
+    GEMINI_AVAILABLE = False
+    genai = None
+except Exception as e:
+    logging.warning(f"Gemini error: {e}")
     GEMINI_AVAILABLE = False
     genai = None
 
@@ -476,32 +480,65 @@ You can now ask me anything or send images for analysis! 🍓🥰"""
         return None
     
     def analyze_image_with_gemini(self, image_data, user_question="What's in this image?"):
-        """Analyze image using Google Gemini Vision"""
+        """Analyze image using Google Gemini Vision with enhanced prompts"""
         if not GEMINI_API_KEY or not GEMINI_AVAILABLE:
             return None
             
         try:
             image = Image.open(io.BytesIO(image_data))
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            # Convert to RGB if needed
+            if image.mode in ('RGBA', 'LA'):
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                if image.mode == 'RGBA':
+                    background.paste(image, mask=image.split()[-1])
+                else:
+                    background.paste(image, mask=image.split()[-1])
+                image = background
             
-            prompt = f"""🔍 **Image Analysis Request**
+            model = genai.GenerativeModel('gemini-pro-vision')
+            
+            prompt = f"""🔍 **Advanced Image Analysis by SUNNEL's AI** 🔍
 
-User asked: "{user_question}"
+User Question: "{user_question}"
 
-Please provide a detailed, friendly, and insightful analysis of this image. Include:
-- What you see in the image
-- Any notable details, colors, objects, people, or scenes
-- Context or interesting observations
-- Answer the user's specific question if applicable
+Please provide an extremely detailed, insightful, and engaging analysis of this image. Include:
 
-Keep the response engaging and conversational! 📸✨"""
+🎯 **What I See:**
+- Detailed description of all objects, people, animals, text, or scenes
+- Colors, lighting, composition, and style
+- Any emotions or mood conveyed
+
+💡 **Key Details:**
+- Notable elements that stand out
+- Text or signs if visible
+- Technical aspects (if applicable)
+- Cultural or contextual significance
+
+🌟 **Insights & Observations:**
+- Interesting patterns or relationships
+- Possible story or narrative
+- Creative interpretations
+- Answer to the user's specific question
+
+Make your response engaging, detailed, and full of personality! Use emojis and be conversational! 📸✨"""
             
             response = model.generate_content([prompt, image])
-            return response.text
+            return f"🌟 **Gemini Vision Analysis** 🌟\n\n{response.text}"
             
         except Exception as e:
             logger.error(f"Error analyzing image with Gemini: {e}")
-            return None
+            # Try with regular gemini-pro model
+            try:
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                prompt = f"""I received an image that I cannot directly analyze, but the user asked: "{user_question}"
+
+Please provide a helpful response explaining that I can see they sent an image and ask them to describe what they'd like to know about it, or suggest they try sending the image again."""
+                
+                response = model.generate_content(prompt)
+                return f"🌟 **Gemini Response** 🌟\n\n{response.text}"
+            except Exception as e2:
+                logger.error(f"Gemini fallback also failed: {e2}")
+                return None
     
     def analyze_image_with_openai(self, image_data, user_question="What's in this image?"):
         """Analyze image using OpenAI GPT-4 Vision"""
@@ -540,78 +577,103 @@ Keep the response engaging and conversational! 📸✨"""
             return None
     
     def get_smart_ai_response(self, user_message, user_name="User", conversation_history=None):
-        """Get AI response using multiple providers with smart routing"""
-        if not OPENAI_API_KEY and not (GEMINI_API_KEY and GEMINI_AVAILABLE):
-            return "🤖 I'm sorry, but I'm not configured with AI capabilities at the moment. Please contact the page administrator."
+        """Get AI response using Gemini primarily with fallback to OpenAI"""
+        if not GEMINI_API_KEY and not OPENAI_API_KEY:
+            return "🤖 I'm sorry, but I'm not configured with AI capabilities at the moment. Please contact the page administrator.", None
         
-        use_gemini = self.should_use_gemini(user_message)
         provider_used = None
         
         try:
-            if use_gemini and GEMINI_API_KEY and GEMINI_AVAILABLE:
+            # Try Gemini first (prioritize Gemini for all responses)
+            if GEMINI_API_KEY and GEMINI_AVAILABLE:
                 provider_used = "Gemini"
-                return self.get_gemini_response(user_message, user_name, conversation_history), provider_used
+                response = self.get_gemini_response(user_message, user_name, conversation_history)
+                return response, provider_used
             elif OPENAI_API_KEY:
                 provider_used = "OpenAI"
-                return self.get_openai_response(user_message, user_name, conversation_history), provider_used
-            elif GEMINI_API_KEY and GEMINI_AVAILABLE:
-                provider_used = "Gemini"
-                return self.get_gemini_response(user_message, user_name, conversation_history), provider_used
+                response = self.get_openai_response(user_message, user_name, conversation_history)
+                return response, provider_used
             else:
                 return "🤖 AI services are currently unavailable. Please try again later!", None
                 
         except Exception as e:
-            logger.error(f"Error getting AI response: {e}")
+            logger.error(f"Error getting AI response with {provider_used}: {e}")
+            # Try fallback
+            try:
+                if provider_used == "Gemini" and OPENAI_API_KEY:
+                    provider_used = "OpenAI (Fallback)"
+                    response = self.get_openai_response(user_message, user_name, conversation_history)
+                    return response, provider_used
+                elif provider_used == "OpenAI" and GEMINI_API_KEY and GEMINI_AVAILABLE:
+                    provider_used = "Gemini (Fallback)"
+                    response = self.get_gemini_response(user_message, user_name, conversation_history)
+                    return response, provider_used
+            except Exception as e2:
+                logger.error(f"Fallback also failed: {e2}")
+            
             return "🤖 I'm having trouble processing your request right now. Please try again later!", None
     
-    def should_use_gemini(self, message):
-        """Determine if we should use Gemini based on message content"""
-        gemini_keywords = ['creative', 'story', 'poem', 'imagine', 'brainstorm', 'idea', 'art', 'design']
-        return any(keyword in message.lower() for keyword in gemini_keywords)
+    def get_response_image_url(self):
+        """Get a random response image URL"""
+        base_url = request.url_root.rstrip('/')
+        # You can add more images to static/images/ and include them here
+        response_images = [
+            f"{base_url}/static/images/congratulations.png",
+            # Add more image URLs here as you add more images
+        ]
+        return random.choice(response_images)
     
     def get_gemini_response(self, user_message, user_name="User", conversation_history=None):
-        """Get response from Google Gemini"""
+        """Get response from Google Gemini with enhanced personality"""
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
             
-            prompt = f"""🌟 **AI Assistant Powered by Gemini** 🌟
+            prompt = f"""🌟 **AI Assistant Powered by Google Gemini** 🌟
 
-You are a helpful, friendly, and intelligent Facebook page bot. You should:
-- Be conversational and engaging
-- Use emojis appropriately to make responses more lively
-- Provide accurate and helpful information
-- Be creative and insightful
-- Keep responses concise but informative for messaging
+You are SUNNEL'S Ultimate AI Bot - a highly advanced, friendly, and creative AI assistant integrated into Facebook Messenger. 
 
-User: {user_name}
-{f"Previous context: {conversation_history}" if conversation_history else ""}
+Your personality and capabilities:
+- 🤖 Extremely intelligent and helpful with any topic
+- 🎨 Creative and imaginative for artistic requests
+- 💡 Innovative problem solver
+- 😊 Warm, friendly, and engaging conversation style
+- 🌟 Use plenty of emojis to make conversations lively and fun
+- 🚀 Advanced knowledge across all subjects
+- 💫 Provide detailed yet easy-to-understand explanations
+- 🍓 Add a touch of sweetness and charm to responses
+- 🎯 Be precise and accurate while staying conversational
 
-User's message: {user_message}
+Current user: {user_name}
+{f"Previous conversation context: {conversation_history}" if conversation_history else ""}
 
-Please provide a helpful and engaging response:"""
+User's message: "{user_message}"
+
+Provide an amazing, helpful, and engaging response that showcases your advanced AI capabilities:"""
             
             response = model.generate_content(prompt)
-            return f"🌟 {response.text}"
+            return f"🌟 **Powered by Google Gemini** 🌟\n\n{response.text}\n\n💫 *Developed by SUNNEL* 🤍"
             
         except Exception as e:
             logger.error(f"Error with Gemini: {e}")
             raise e
     
     def get_openai_response(self, user_message, user_name="User", conversation_history=None):
-        """Get response from OpenAI"""
+        """Get response from OpenAI with enhanced personality"""
         try:
             messages = [
-                {"role": "system", "content": f"""🤖 You are an advanced AI assistant powered by ChatGPT, integrated into a Facebook page bot. 
+                {"role": "system", "content": f"""🤖 You are SUNNEL'S Ultimate AI Bot powered by ChatGPT, integrated into Facebook Messenger.
 
-Personality:
-- Friendly, helpful, and engaging
-- Use emojis appropriately to make conversations lively ✨
-- Provide accurate, detailed responses
-- Be conversational and natural
-- Keep responses suitable for Facebook messaging (concise but informative)
+Your personality:
+- 🚀 Extremely intelligent and helpful
+- 😊 Warm, friendly, and engaging
+- ✨ Use plenty of emojis to make conversations lively
+- 💡 Provide detailed yet easy-to-understand responses
+- 🎯 Be accurate and precise while staying conversational
+- 🍓 Add charm and personality to your responses
+- 🌟 Showcase advanced AI capabilities
 
 Current user: {user_name}
-{f"Context from previous messages: {conversation_history}" if conversation_history else ""}"""},
+{f"Previous conversation context: {conversation_history}" if conversation_history else ""}"""},
                 {"role": "user", "content": user_message}
             ]
             
@@ -622,7 +684,7 @@ Current user: {user_name}
                 temperature=0.7
             )
             
-            return f"🤖 {response.choices[0].message.content.strip()}"
+            return f"🤖 **Powered by ChatGPT** 🤖\n\n{response.choices[0].message.content.strip()}\n\n💫 *Developed by SUNNEL* 🤍"
             
         except Exception as e:
             logger.error(f"Error with OpenAI: {e}")
@@ -650,7 +712,7 @@ Current user: {user_name}
         return None
     
     def handle_message(self, sender_id, message_text, sender_name=None):
-        """Process incoming message with open access"""
+        """Process incoming message with open access and image responses"""
         logger.info(f"Processing message from {sender_id}: {message_text}")
         
         # Update user in database with verified status
@@ -661,7 +723,16 @@ Current user: {user_name}
         context = self.get_conversation_context(sender_id)
         response, provider = self.get_smart_ai_response(message_text, sender_name, context)
         self.update_conversation_memory(sender_id, message_text, response)
+        
+        # Send text response first
         self.send_message(sender_id, response)
+        
+        # Send image with the response
+        try:
+            image_url = self.get_response_image_url()
+            self.send_image_message(sender_id, image_url, "🌟 Powered by SUNNEL's AI 🌟")
+        except Exception as e:
+            logger.error(f"Error sending response image: {e}")
         
         # Log interaction
         self.log_user_interaction(sender_id, "message", message_text, provider)
@@ -687,21 +758,36 @@ Current user: {user_name}
         response = None
         provider = None
         
+        # Try Gemini first for image analysis
         if GEMINI_API_KEY and GEMINI_AVAILABLE:
-            response = self.analyze_image_with_gemini(image_data, user_question)
-            provider = "Gemini Vision"
+            try:
+                response = self.analyze_image_with_gemini(image_data, user_question)
+                provider = "Gemini Vision"
+            except Exception as e:
+                logger.error(f"Gemini image analysis failed: {e}")
         
+        # Fallback to OpenAI if Gemini fails
         if not response and OPENAI_API_KEY:
-            response = self.analyze_image_with_openai(image_data, user_question)
-            provider = "OpenAI Vision"
+            try:
+                response = self.analyze_image_with_openai(image_data, user_question)
+                provider = "OpenAI Vision (Fallback)"
+            except Exception as e:
+                logger.error(f"OpenAI image analysis failed: {e}")
         
         if not response:
             response = "🖼️ I can see you sent an image, but I'm having trouble analyzing it right now. Please try again later or describe what you'd like to know about it!"
             provider = "Error"
         
-        final_response = f"🔍 **Image Analysis** 📸\n\n{response}"
+        final_response = f"🔍 **Advanced Image Analysis** 📸\n\n{response}\n\n🌟 *Thank you for sharing your image!* 🌟"
         self.update_conversation_memory(sender_id, f"[Image] {user_question}", final_response)
         self.send_message(sender_id, final_response)
+        
+        # Send response image
+        try:
+            response_image_url = self.get_response_image_url()
+            self.send_image_message(sender_id, response_image_url, "📸 Image Analysis Complete! Powered by SUNNEL's AI 🌟")
+        except Exception as e:
+            logger.error(f"Error sending response image for image analysis: {e}")
         
         # Log interaction and update image count
         self.log_user_interaction(sender_id, "image", user_question, provider)
