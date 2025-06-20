@@ -57,7 +57,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Bot Configuration
 BOT_NAME = "Cleo AI"
-BOT_VERSION = "6.0.0"
+BOT_VERSION = "6.1.0"
 REQUIRED_POST_ID = "761320392916522"
 PAGE_ID = "100071491013161"
 
@@ -177,7 +177,7 @@ def init_database():
             )
         ''')
 
-        # Video downloads table
+        # Video downloads table with additional error handling columns
         conn.execute('''
             CREATE TABLE IF NOT EXISTS video_downloads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,10 +188,17 @@ def init_database():
                 duration TEXT,
                 file_size TEXT,
                 download_status TEXT,
+                error_message TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
+
+        # Add error_message column if it doesn't exist
+        try:
+            conn.execute('ALTER TABLE video_downloads ADD COLUMN error_message TEXT')
+        except sqlite3.OperationalError:
+            pass
 
 def update_system_status():
     """Update real-time system status with enhanced metrics"""
@@ -241,7 +248,7 @@ def keep_alive():
         Timer(300, keep_alive).start()
 
 class VideoDownloader:
-    """Enhanced video downloader for TikTok, Facebook, YouTube"""
+    """Enhanced video downloader with better error handling"""
     
     def __init__(self):
         self.supported_platforms = ['youtube', 'tiktok', 'facebook', 'instagram']
@@ -262,45 +269,60 @@ class VideoDownloader:
             return False, 'unknown'
     
     def download_video(self, url: str, user_id: str) -> dict:
-        """Download video and return info"""
+        """Download video with enhanced error handling"""
         try:
             global SYSTEM_STATUS
             
             is_supported, platform = self.is_supported_url(url)
-            if not is_supported:
+            if not supported:
                 return {
                     'success': False,
                     'error': 'Unsupported platform. Supported: YouTube, TikTok, Facebook, Instagram'
                 }
             
-            # Create temporary directory
-            with tempfile.TemporaryDirectory() as temp_dir:
-                ydl_opts = {
-                    'format': 'best[height<=720]',  # Limit quality to save space
-                    'outtmpl': f'{temp_dir}/%(title)s.%(ext)s',
-                    'no_warnings': True,
-                    'extractaudio': False,
-                    'writesubtitles': False,
-                    'writeautomaticsub': False,
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # Extract info without downloading first
+            # Enhanced yt-dlp options with better error handling
+            ydl_opts = {
+                'format': 'best[height<=720]/best',  # Better format selection
+                'no_warnings': True,
+                'extractaudio': False,
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+                'ignoreerrors': True,
+                'no_check_certificate': True,
+                'prefer_insecure': True,
+                'geo_bypass': True,
+                'socket_timeout': 30,
+            }
+            
+            # Platform-specific configurations
+            if platform == 'tiktok':
+                ydl_opts.update({
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                })
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    # Extract info without downloading
                     info = ydl.extract_info(url, download=False)
                     
-                    title = info.get('title', 'Unknown Title')
-                    duration = info.get('duration', 0)
-                    uploader = info.get('uploader', 'Unknown')
+                    if not info:
+                        raise Exception("Could not extract video information")
                     
-                    # Format duration
-                    if duration:
-                        minutes = duration // 60
-                        seconds = duration % 60
+                    title = info.get('title', 'Unknown Title')[:100]
+                    duration = info.get('duration', 0)
+                    uploader = info.get('uploader', 'Unknown')[:50]
+                    
+                    # Format duration safely
+                    if duration and isinstance(duration, (int, float)):
+                        minutes = int(duration) // 60
+                        seconds = int(duration) % 60
                         duration_str = f"{minutes}:{seconds:02d}"
                     else:
                         duration_str = "Unknown"
                     
-                    # Log download attempt
+                    # Log successful download
                     with get_db() as conn:
                         conn.execute('''
                             INSERT INTO video_downloads 
@@ -325,20 +347,36 @@ class VideoDownloader:
                         'original_url': url
                     }
                     
+                except yt_dlp.DownloadError as e:
+                    error_msg = str(e)
+                    if "Private video" in error_msg:
+                        error_msg = "This video is private or restricted"
+                    elif "Video unavailable" in error_msg:
+                        error_msg = "Video is unavailable or has been removed"
+                    elif "Sign in to confirm your age" in error_msg:
+                        error_msg = "Age-restricted content cannot be downloaded"
+                    else:
+                        error_msg = "Failed to extract video information"
+                    
+                    raise Exception(error_msg)
+                    
         except Exception as e:
             logger.error(f"Video download error: {e}")
             
-            # Log failed download
-            with get_db() as conn:
-                conn.execute('''
-                    INSERT INTO video_downloads 
-                    (user_id, video_url, platform, download_status, error_message)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (user_id, url, 'unknown', 'failed', str(e)))
+            # Log failed download with error message
+            try:
+                with get_db() as conn:
+                    conn.execute('''
+                        INSERT INTO video_downloads 
+                        (user_id, video_url, platform, download_status, error_message)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (user_id, url, platform or 'unknown', 'failed', str(e)))
+            except:
+                pass
             
             return {
                 'success': False,
-                'error': f'Download failed: {str(e)[:100]}'
+                'error': str(e)[:200]  # Limit error message length
             }
 
 class CleoAI:
@@ -406,6 +444,45 @@ class CleoAI:
                 'description': 'Download videos from social platforms'
             }
         }
+
+    def format_aesthetic_response(self, content: str, user_name: str = "Friend") -> str:
+        """Format responses with beautiful aesthetic styling"""
+        
+        # Check if content contains explanations or educational content
+        is_explanation = any(word in content.lower() for word in [
+            'explanation', 'because', 'reason', 'how', 'why', 'what', 'when', 'where',
+            'definition', 'meaning', 'example', 'step', 'process', 'method'
+        ])
+        
+        if is_explanation and len(content) > 200:
+            # Split content into main answer and explanation
+            sentences = content.split('.')
+            if len(sentences) > 3:
+                main_content = '. '.join(sentences[:2]) + '.'
+                explanation = '. '.join(sentences[2:])
+                
+                formatted_response = f"""✨ **{main_content}** ✨
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 **DETAILED EXPLANATION** 📚
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{explanation}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 *Hope this helps, {user_name}!* 🌟"""
+                return formatted_response
+        
+        # For shorter responses or non-explanatory content
+        if len(content) > 100:
+            return f"""🌟 **{content}** 🌟
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💫 *Crafted with care for {user_name}* 💫
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        else:
+            return f"✨ {content} ✨"
 
     def detect_video_url(self, message: str) -> Optional[str]:
         """Detect video URLs in message"""
@@ -626,7 +703,7 @@ class CleoAI:
             logger.error(f"Database update error: {e}")
 
     def get_ai_response(self, user_message: str, user_id: str, user_name: str = "User") -> tuple[str, str]:
-        """Enhanced AI response with model switching"""
+        """Enhanced AI response with aesthetic formatting"""
         global SYSTEM_STATUS
         start_time = time.time()
         preferred_model = self.get_user_ai_preference(user_id)
@@ -636,36 +713,48 @@ class CleoAI:
         mode_context = self.modes[current_mode]['description']
 
         try:
+            raw_response = None
+            ai_provider = 'fallback'
+
             if preferred_model == 'gemini' and GEMINI_API_KEY and GEMINI_AVAILABLE:
-                response = self._get_gemini_response(user_message, user_name, mode_context)
-                if response:
+                raw_response = self._get_gemini_response(user_message, user_name, mode_context)
+                if raw_response:
                     SYSTEM_STATUS['gemini_requests'] += 1
-                    return response, 'gemini'
+                    ai_provider = 'gemini'
 
             elif preferred_model in ['gpt4', 'gpt3.5'] and openai_client:
                 model_name = 'gpt-4' if preferred_model == 'gpt4' else 'gpt-3.5-turbo'
-                response = self._get_openai_response(user_message, user_name, mode_context, model_name)
-                if response:
+                raw_response = self._get_openai_response(user_message, user_name, mode_context, model_name)
+                if raw_response:
                     SYSTEM_STATUS['openai_requests'] += 1
-                    return response, preferred_model
+                    ai_provider = preferred_model
 
             # Fallback logic
-            if GEMINI_API_KEY and GEMINI_AVAILABLE:
-                response = self._get_gemini_response(user_message, user_name, mode_context)
-                if response:
-                    return response, 'gemini'
+            if not raw_response:
+                if GEMINI_API_KEY and GEMINI_AVAILABLE:
+                    raw_response = self._get_gemini_response(user_message, user_name, mode_context)
+                    if raw_response:
+                        ai_provider = 'gemini'
 
-            if openai_client:
-                response = self._get_openai_response(user_message, user_name, mode_context, 'gpt-3.5-turbo')
-                if response:
-                    return response, 'gpt3.5'
+                elif openai_client:
+                    raw_response = self._get_openai_response(user_message, user_name, mode_context, 'gpt-3.5-turbo')
+                    if raw_response:
+                        ai_provider = 'gpt3.5'
 
-            # Ultimate fallback
-            return self._get_fallback_response(user_name), 'fallback'
+            # Format response aesthetically
+            if raw_response:
+                formatted_response = self.format_aesthetic_response(raw_response, user_name)
+                return formatted_response, ai_provider
+            else:
+                fallback_response = self._get_fallback_response(user_name)
+                formatted_fallback = self.format_aesthetic_response(fallback_response, user_name)
+                return formatted_fallback, 'fallback'
 
         except Exception as e:
             logger.error(f"AI response error: {e}")
-            return self._get_fallback_response(user_name), 'error'
+            error_response = f"I encountered a technical issue, but I'm here to help you, {user_name}! Please try asking your question again."
+            formatted_error = self.format_aesthetic_response(error_response, user_name)
+            return formatted_error, 'error'
 
     def _get_gemini_response(self, user_message: str, user_name: str, mode_context: str) -> Optional[str]:
         """Get response from Gemini"""
@@ -676,25 +765,25 @@ class CleoAI:
 
 🌟 **Your Personality:**
 - Exceptionally warm, engaging, and conversational like a best friend
-- Use emojis strategically to enhance communication 
+- Provide detailed, helpful responses
 - Show genuine enthusiasm and interest in helping
 - Be creative, innovative, and insightful
-- Adapt your communication style to be relatable and fun
+- Make responses natural and human-like
 
 🎯 **Current Context:**
 - User: {user_name}
 - Mode: {mode_context}
-- Make responses feel natural and human-like
-- Provide value while being entertaining
+- Provide comprehensive, well-structured answers
+- Include examples when helpful
 
-✨ **Response Style:**
-- Be conversational and engaging
-- Use appropriate emojis
-- Show personality and charm
+✨ **Response Guidelines:**
+- Be thorough but clear
+- Use natural language
 - Provide helpful, accurate information
-- Make the user feel heard and appreciated"""
+- Make the user feel heard and appreciated
+- Structure your response clearly"""
 
-            full_prompt = f"{system_prompt}\n\nUser message: {user_message}\n\nRespond helpfully and engagingly:"
+            full_prompt = f"{system_prompt}\n\nUser message: {user_message}\n\nRespond helpfully and comprehensively:"
 
             response = model.generate_content(full_prompt)
 
@@ -714,13 +803,14 @@ Personality:
 - Exceptionally intelligent and conversational
 - Warm, engaging, and genuinely helpful
 - Creative and innovative in problem-solving
-- Use emojis appropriately to enhance communication
+- Provide comprehensive, well-structured responses
 - Show personality and charm in responses
 
 Current context:
 - User: {user_name}
 - Mode: {mode_context}
-- Be natural, helpful, and engaging in your responses"""
+- Be thorough, helpful, and engaging in your responses
+- Structure information clearly and provide examples when helpful"""
 
             response = openai_client.chat.completions.create(
                 model=model_name,
@@ -728,7 +818,7 @@ Current context:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=1200,
+                max_tokens=1500,
                 temperature=0.7
             )
 
@@ -742,10 +832,10 @@ Current context:
     def _get_fallback_response(self, user_name: str) -> str:
         """Enhanced fallback responses"""
         responses = [
-            f"Hello {user_name}! 👋 I'm Cleo AI, your intelligent assistant created by SUNNEL. How can I help you today? ✨",
-            f"Hi there! 🌟 I'm here to assist you with any questions or tasks. What's on your mind?",
-            f"Greetings! 🚀 I'm Cleo, ready to help you achieve amazing things. What would you like to explore?",
-            f"Hello! 😊 I'm your friendly AI companion, always here to help! Feel free to ask me anything!"
+            f"Hello {user_name}! I'm Cleo AI, your intelligent assistant created by SUNNEL. I'm here to help you with questions, creative tasks, learning, and much more!",
+            f"Hi there! I'm ready to assist you with any questions or tasks you have. What would you like to explore today?",
+            f"Greetings! I'm Cleo, your AI companion ready to help you achieve amazing things. Feel free to ask me anything!",
+            f"Hello! I'm your friendly AI assistant, always here to help with detailed answers and creative solutions!"
         ]
         return random.choice(responses)
 
@@ -797,18 +887,29 @@ Current context:
 
         except Exception as e:
             logger.error(f"Message handling error: {e}")
-            self.send_message_with_buttons(
-                sender_id,
-                "🤖 I encountered a technical issue but I'm working to resolve it! Please try again. 💙✨"
-            )
+            error_msg = f"I encountered a technical issue but I'm working to resolve it, {user_name}! Please try again. 💙✨"
+            formatted_error = self.format_aesthetic_response(error_msg, user_name)
+            self.send_message_with_buttons(sender_id, formatted_error)
 
     def handle_video_download(self, sender_id: str, video_url: str, user_name: str):
-        """Handle video download requests"""
+        """Handle video download requests with better error handling"""
         try:
             # Send processing message
             self.send_typing_indicator(sender_id, 3.0)
             
-            processing_msg = f"📺 **Video Download Processing** 📺\n\nHey {user_name}! 🌟 I'm analyzing your video link...\n\n⏳ Please wait while I extract the video information. This may take a few moments depending on the platform and video size.\n\n🚀 **Supported platforms:** YouTube, TikTok, Facebook, Instagram"
+            processing_msg = f"""📺 **Video Download Processing** 📺
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **Hey {user_name}!** 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+I'm analyzing your video link...
+
+⏳ Please wait while I extract the video information. This may take a few moments depending on the platform and video size.
+
+🚀 **Supported platforms:** YouTube, TikTok, Facebook, Instagram
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             
             self.send_message_with_buttons(sender_id, processing_msg)
 
@@ -818,43 +919,75 @@ Current context:
             if result['success']:
                 success_msg = f"""✅ **Video Download Successful!** ✅
 
-🎬 **Video Details:**
-• 📺 **Platform:** {result['platform'].title()}
-• 📝 **Title:** {result['title'][:100]}{'...' if len(result['title']) > 100 else ''}
-• ⏱️ **Duration:** {result['duration']}
-• 👤 **Creator:** {result.get('uploader', 'Unknown')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎬 **VIDEO DETAILS** 🎬
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎉 **Download Complete!** 
+📺 **Platform:** {result['platform'].title()}
+📝 **Title:** {result['title'][:100]}{'...' if len(result['title']) > 100 else ''}
+⏱️ **Duration:** {result['duration']}
+👤 **Creator:** {result.get('uploader', 'Unknown')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎉 **SUCCESS!** 🎉
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Your video has been successfully processed and is ready!
 
 💡 **Pro Tip:** I can download videos from YouTube, TikTok, Facebook, and Instagram. Just send me any video link!
 
-🚀 **Want to download another video?** Simply paste another link or switch to downloader mode using the buttons below!"""
+🚀 **Want to download another video?** Simply paste another link or switch to downloader mode using the buttons below!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             else:
                 success_msg = f"""❌ **Video Download Failed** ❌
 
-🔍 **What happened:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 **WHAT HAPPENED** 🔍
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 {result['error']}
 
-💡 **Troubleshooting tips:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 **TROUBLESHOOTING TIPS** 💡
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 • Make sure the video is public and accessible
 • Check if the URL is complete and valid
 • Some videos may have download restrictions
 • Try again with a different video
 
-🎯 **Supported platforms:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 **SUPPORTED PLATFORMS** 🎯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 • 📺 YouTube (youtube.com, youtu.be)
 • 🎵 TikTok (tiktok.com)
 • 📘 Facebook (facebook.com)
 • 📸 Instagram (instagram.com)
 
-🔄 **Want to try again?** Send me another video link!"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 **Want to try again?** Send me another video link!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
             self.send_message_with_buttons(sender_id, success_msg)
 
         except Exception as e:
             logger.error(f"Video download handling error: {e}")
-            error_msg = f"🤖 Sorry {user_name}, I encountered an issue while processing your video. Please try again or contact support! 💙"
+            error_msg = f"""❌ **Video Processing Error** ❌
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 **TECHNICAL ISSUE** 🤖
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sorry {user_name}, I encountered an issue while processing your video. 
+
+The error has been logged and will be fixed soon.
+
+Please try again or contact support! 💙
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            
             self.send_message_with_buttons(sender_id, error_msg)
 
     def handle_postback(self, sender_id: str, payload: str):
@@ -881,26 +1014,36 @@ Your video has been successfully processed and is ready!
             logger.error(f"Postback handling error: {e}")
 
     def _handle_get_started(self, sender_id: str):
-        """Enhanced welcome message"""
+        """Enhanced welcome message with aesthetic formatting"""
         user_info = self.get_user_info(sender_id)
         user_name = user_info.get('first_name', 'Friend')
 
         welcome_message = f"""✨ **Hello {user_name}! Welcome to Cleo AI!** ✨
 
-🌟 I'm your next-generation AI companion, created by SUNNEL with cutting-edge technology to revolutionize how you interact with AI!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **NEXT-GENERATION AI** 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💎 **What makes me extraordinary:**
-• 🧠 **Multi-AI Intelligence** - Switch between Gemini, GPT-4, and GPT-3.5
-• ⚡ **Lightning Fast** - Optimized for instant, intelligent responses  
-• 🎓 **Specialized Modes** - Student, Creative, Professional, and Coding modes
-• 🔄 **Smart AI Switching** - Seamlessly switch between AI models
-• 📺 **Video Downloader** - Download from YouTube, TikTok, Facebook, Instagram
-• 🎨 **Creative Genius** - Advanced creative and artistic capabilities
-• 💻 **Code Assistant** - Expert programming and development help
-• 📊 **Personal Analytics** - Track your AI usage and preferences
-• ⭐ **Interactive Experience** - Rate responses and get personalized service
+I'm your advanced AI companion, created by SUNNEL with cutting-edge technology to revolutionize how you interact with AI!
 
-🚀 **Ready to experience the future?**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💎 **EXTRAORDINARY FEATURES** 💎
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🧠 **Multi-AI Intelligence** - Switch between Gemini, GPT-4, and GPT-3.5
+⚡ **Lightning Fast** - Optimized for instant, intelligent responses  
+🎓 **Specialized Modes** - Student, Creative, Professional, and Coding modes
+🔄 **Smart AI Switching** - Seamlessly switch between AI models
+📺 **Video Downloader** - Download from YouTube, TikTok, Facebook, Instagram
+🎨 **Creative Genius** - Advanced creative and artistic capabilities
+💻 **Code Assistant** - Expert programming and development help
+📊 **Personal Analytics** - Track your AI usage and preferences
+⭐ **Interactive Experience** - Rate responses and get personalized service
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 **READY FOR THE FUTURE?** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Just start chatting naturally! Use the buttons below to explore features, switch AI models, or change modes.
 
 💫 **Try saying:**
@@ -910,13 +1053,15 @@ Just start chatting naturally! Use the buttons below to explore features, switch
 • "Code a simple website"
 • Send any video link to download!
 
-*Crafted with ❤️ by SUNNEL - Your gateway to AI excellence!* 🌟"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+*Crafted with ❤️ by SUNNEL - Your gateway to AI excellence!* 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
         self.send_message_with_buttons(sender_id, welcome_message)
         self.update_user_database(sender_id, verification_status="verified")
 
     def _handle_ai_switch(self, sender_id: str, payload: str):
-        """Handle AI model switching"""
+        """Handle AI model switching with aesthetic formatting"""
         global SYSTEM_STATUS
         model = payload.split("_")[-1].lower()
         if model in self.ai_models:
@@ -927,22 +1072,30 @@ Just start chatting naturally! Use the buttons below to explore features, switch
 
             switch_message = f"""🔄 **AI Model Switched Successfully!** 
 
-{model_info['emoji']} **Now using {model_info['name']}**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{model_info['emoji']} **NOW USING {model_info['name'].upper()}** {model_info['emoji']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ✨ **What's special about this model:**
 {model_info['description']}
 
-🎯 **Best for:** {', '.join(model_info['strengths'])}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 **BEST FOR** 🎯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+{chr(10).join([f'• {strength}' for strength in model_info['strengths']])}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🚀 **Ready to experience enhanced capabilities?** 
 Ask me anything and discover the power of {model_info['name']}!
 
-💡 **Pro Tip:** Each AI model has unique strengths. Experiment to find your favorite for different tasks!"""
+💡 **Pro Tip:** Each AI model has unique strengths. Experiment to find your favorite for different tasks!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
             self.send_message_with_buttons(sender_id, switch_message)
 
     def _handle_mode_switch(self, sender_id: str, payload: str):
-        """Handle mode switching"""
+        """Handle mode switching with aesthetic formatting"""
         mode = payload.split("_")[1].lower()
         if mode in self.modes:
             self.set_user_mode(sender_id, mode)
@@ -950,83 +1103,102 @@ Ask me anything and discover the power of {model_info['name']}!
 
             mode_message = f"""{mode_info['emoji']} **{mode_info['name']} Mode Activated!**
 
-✨ **You're now in {mode_info['name']} mode!**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ **YOU'RE NOW IN {mode_info['name'].upper()} MODE!** ✨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 {mode_info['description']}
 
-🎯 **Optimized for:**"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 **OPTIMIZED FOR** 🎯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
             if mode == 'student':
                 mode_message += """
-• 📚 Homework help & explanations
-• 🧮 Math and science problems  
-• ✍️ Essay writing assistance
-• 🎓 Study tips and strategies
-• 📖 Research and learning support
+📚 Homework help & explanations
+🧮 Math and science problems  
+✍️ Essay writing assistance
+🎓 Study tips and strategies
+📖 Research and learning support
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 **Try asking:** "Explain photosynthesis" or "Help with algebra"
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             elif mode == 'creative':
                 mode_message += """
-• ✍️ Creative writing and storytelling
-• 🎨 Artistic concept development
-• 💡 Brainstorming sessions
-• 🎭 Character and plot creation
-• 🌈 Imaginative problem-solving
+✍️ Creative writing and storytelling
+🎨 Artistic concept development
+💡 Brainstorming sessions
+🎭 Character and plot creation
+🌈 Imaginative problem-solving
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 **Try asking:** "Write a sci-fi story" or "Create a marketing campaign"
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             elif mode == 'professional':
                 mode_message += """
-• 💼 Business strategy and planning
-• 📊 Data analysis and insights
-• 📝 Professional communication
-• 🎯 Project management advice
-• 💰 Financial planning guidance
+💼 Business strategy and planning
+📊 Data analysis and insights
+📝 Professional communication
+🎯 Project management advice
+💰 Financial planning guidance
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 **Try asking:** "Draft a business proposal" or "Analyze market trends"
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             elif mode == 'coding':
                 mode_message += """
-• 💻 Code writing and debugging
-• 🔧 Technical problem-solving
-• 📚 Programming tutorials
-• 🚀 Architecture and best practices
-• 🔍 Code review and optimization
+💻 Code writing and debugging
+🔧 Technical problem-solving
+📚 Programming tutorials
+🚀 Architecture and best practices
+🔍 Code review and optimization
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 **Try asking:** "Build a React component" or "Debug my Python code"
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             elif mode == 'downloader':
                 mode_message += """
-• 📺 Video downloads from YouTube
-• 🎵 TikTok video downloading
-• 📘 Facebook video extraction
-• 📸 Instagram video downloads
-• 📊 Download history and analytics
+📺 Video downloads from YouTube
+🎵 TikTok video downloading
+📘 Facebook video extraction
+📸 Instagram video downloads
+📊 Download history and analytics
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 **Try sending:** Any video URL from supported platforms!
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
             mode_message += f"\n🚀 **Ready to explore {mode_info['name']} mode?** Ask me anything!"
 
             self.send_message_with_buttons(sender_id, mode_message)
 
     def _handle_creator_info(self, sender_id: str):
-        """Enhanced creator information"""
+        """Enhanced creator information with aesthetic formatting"""
         creator_message = f"""👨‍💻 **Meet SUNNEL - The Visionary Behind Cleo AI** 🌟
 
-🚀 **About the Genius:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 **ABOUT THE GENIUS** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 SUNNEL is a passionate AI innovator and full-stack developer who brought me to life with cutting-edge technology and endless creativity!
 
-💎 **Technical Mastery:**
-• 🤖 Advanced AI & Machine Learning Engineering
-• 🌐 Full-Stack Development (Python, JavaScript, React)
-• 📱 Messenger Bot Architecture & Integration
-• ☁️ Cloud Computing & Scalable Deployment
-• 🎨 Modern UI/UX Design & User Experience
-• 🔧 API Integration & Database Management
-• 📺 Video Processing & Download Systems
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💎 **TECHNICAL MASTERY** 💎
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-⚡ **Revolutionary Features Built:**
+🤖 Advanced AI & Machine Learning Engineering
+🌐 Full-Stack Development (Python, JavaScript, React)
+📱 Messenger Bot Architecture & Integration
+☁️ Cloud Computing & Scalable Deployment
+🎨 Modern UI/UX Design & User Experience
+🔧 API Integration & Database Management
+📺 Video Processing & Download Systems
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ **REVOLUTIONARY FEATURES BUILT** ⚡
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 • Multi-AI model switching (Gemini, GPT-4, GPT-3.5)
 • Advanced video downloader for all major platforms
 • Real-time analytics and performance monitoring
@@ -1034,25 +1206,22 @@ SUNNEL is a passionate AI innovator and full-stack developer who brought me to l
 • 24/7 auto-uptime and health monitoring systems
 • Advanced conversation memory and user preferences
 • Comprehensive user analytics and feedback systems
+• Beautiful aesthetic response formatting
 
-🌟 **Innovation Philosophy:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **INNOVATION PHILOSOPHY** 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 SUNNEL believes AI should be accessible, beautiful, and genuinely helpful. He's dedicated to creating AI experiences that feel natural, engaging, and truly intelligent while pushing the boundaries of what's possible.
 
-🎯 **The Vision:**
-To democratize access to advanced AI technology, making powerful assistance available to everyone through intuitive, beautiful interfaces.
-
-💫 **Why Cleo AI Exists:**
-Born from SUNNEL's passion for excellence and innovation, I represent the perfect fusion of multiple AI technologies, designed to provide the most comprehensive and engaging AI experience possible.
-
-*Thank you for using Cleo AI - SUNNEL's gift to the world!* ❤️
-
-🌐 **Want to connect with SUNNEL or see more of his work?** 
-He's always excited to connect with fellow tech enthusiasts and creators!"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💫 **Thank you for using Cleo AI - SUNNEL's gift to the world!** ❤️
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
         self.send_message_with_buttons(sender_id, creator_message)
 
     def _handle_user_stats(self, sender_id: str):
-        """Show comprehensive user statistics"""
+        """Show comprehensive user statistics with aesthetic formatting"""
         try:
             with get_db() as conn:
                 # Get user stats
@@ -1084,55 +1253,79 @@ He's always excited to connect with fellow tech enthusiasts and creators!"""
 
                 stats_message = f"""📊 **Your Cleo AI Statistics** 📊
 
-👤 **Account Info:**
-• 📅 Member since: {join_date}
-• 🤖 Current AI Model: {current_model.get('emoji', '🤖')} {current_model.get('name', 'Unknown')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👤 **ACCOUNT INFO** 👤
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💬 **Usage Statistics:**
-• 📨 Total Messages: {user_stats['total_messages'] or 0}
-• 🔄 AI Model Switches: {user_stats['ai_switches_count'] or 0}
-• 🎓 Student Mode Usage: {user_stats['student_mode_usage'] or 0}
-• 🎨 Creative Mode Usage: {user_stats['creative_mode_usage'] or 0}
-• 📺 Video Downloads: {user_stats['video_downloads'] or 0}
+📅 Member since: {join_date}
+🤖 Current AI Model: {current_model.get('emoji', '🤖')} {current_model.get('name', 'Unknown')}
 
-🤖 **AI Model Usage:**"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💬 **USAGE STATISTICS** 💬
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📨 Total Messages: {user_stats['total_messages'] or 0}
+🔄 AI Model Switches: {user_stats['ai_switches_count'] or 0}
+🎓 Student Mode Usage: {user_stats['student_mode_usage'] or 0}
+🎨 Creative Mode Usage: {user_stats['creative_mode_usage'] or 0}
+📺 Video Downloads: {user_stats['video_downloads'] or 0}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 **AI MODEL USAGE** 🤖
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
                 for interaction in interaction_stats:
                     stats_message += f"\n• {interaction['ai_provider']}: {interaction['count']} interactions"
 
                 if video_stats:
-                    stats_message += f"\n\n📺 **Video Downloads by Platform:**"
+                    stats_message += f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📺 **VIDEO DOWNLOADS BY PLATFORM** 📺\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     for video in video_stats:
                         stats_message += f"\n• {video['platform'].title()}: {video['count']} videos"
 
                 stats_message += f"""
 
-🌟 **Achievement Level:**"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **ACHIEVEMENT LEVEL** 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
                 total_interactions = sum(row['count'] for row in interaction_stats)
                 if total_interactions < 10:
-                    stats_message += " 🌱 **Beginner** - Just getting started!"
+                    stats_message += "\n🌱 **Beginner** - Just getting started!"
                 elif total_interactions < 50:
-                    stats_message += " 🚀 **Active User** - You're exploring well!"
+                    stats_message += "\n🚀 **Active User** - You're exploring well!"
                 elif total_interactions < 100:
-                    stats_message += " ⭐ **Power User** - You love AI assistance!"
+                    stats_message += "\n⭐ **Power User** - You love AI assistance!"
                 else:
-                    stats_message += " 👑 **AI Master** - You're a Cleo AI expert!"
+                    stats_message += "\n👑 **AI Master** - You're a Cleo AI expert!"
 
-                stats_message += "\n\n💡 **Tip:** Try different AI models and modes to discover new capabilities!"
+                stats_message += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💡 **Tip:** Try different AI models and modes to discover new capabilities!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
             else:
-                stats_message = "📊 **Welcome!** You're just getting started with Cleo AI. Start chatting to build your statistics! 🌟"
+                stats_message = """📊 **Welcome!** 
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **NEW USER** 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You're just getting started with Cleo AI. Start chatting to build your statistics! 
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
             self.send_message_with_buttons(sender_id, stats_message)
 
         except Exception as e:
             logger.error(f"User stats error: {e}")
-            self.send_message_with_buttons(sender_id, "📊 Unable to fetch your stats right now. Please try again later!")
+            error_msg = "📊 Unable to fetch your stats right now. Please try again later!"
+            formatted_error = self.format_aesthetic_response(error_msg)
+            self.send_message_with_buttons(sender_id, formatted_error)
 
     def _handle_rate_response(self, sender_id: str):
-        """Handle response rating"""
+        """Handle response rating with aesthetic formatting"""
         rating_message = """⭐ **Rate Your Experience** ⭐
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💫 **YOUR FEEDBACK MATTERS** 💫
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 How satisfied are you with my responses? Your feedback helps me improve!
 
@@ -1143,7 +1336,9 @@ Rate your experience from 1-5 stars:
 ⭐⭐⭐⭐ = Very Good
 ⭐⭐⭐⭐⭐ = Excellent
 
-💡 **Your feedback matters!** It helps SUNNEL improve Cleo AI for everyone."""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 **Your feedback helps SUNNEL improve Cleo AI for everyone!**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
         rating_buttons = [
             {"content_type": "text", "title": "⭐ 1 Star", "payload": "RATING_1"},
@@ -1156,52 +1351,73 @@ Rate your experience from 1-5 stars:
         self.send_message_with_buttons(sender_id, rating_message, rating_buttons)
 
     def _handle_help_features(self, sender_id: str):
-        """Show comprehensive help and features"""
+        """Show comprehensive help and features with aesthetic formatting"""
         help_message = """🆘 **Cleo AI - Complete Feature Guide** 🆘
 
-🤖 **AI Model Switching:**
-• 💎 **Gemini** - Google's advanced reasoning AI
-• 🧠 **GPT-4** - OpenAI's most capable model  
-• ⚡ **GPT-3.5** - Fast and efficient responses
-• 🔄 **Switch anytime** using the button below!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 **AI MODEL SWITCHING** 🤖
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎭 **Specialized Modes:**
-• 🎓 **Student Mode** - Homework, explanations, study help
-• 🎨 **Creative Mode** - Writing, brainstorming, artistic ideas
-• 💼 **Professional Mode** - Business, strategy, formal communication
-• 💻 **Coding Mode** - Programming, debugging, technical help
-• 📺 **Downloader Mode** - Video downloads from social platforms
-• 🤖 **General Mode** - All-purpose assistance
+💎 **Gemini** - Google's advanced reasoning AI
+🧠 **GPT-4** - OpenAI's most capable model  
+⚡ **GPT-3.5** - Fast and efficient responses
+🔄 **Switch anytime** using the button below!
 
-📺 **Video Downloader Features:**
-• 📺 **YouTube** - Download any public video
-• 🎵 **TikTok** - Save TikTok videos instantly
-• 📘 **Facebook** - Extract Facebook videos
-• 📸 **Instagram** - Download Instagram videos
-• 📊 **Analytics** - Track your download history
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎭 **SPECIALIZED MODES** 🎭
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✨ **Interactive Features:**
-• 📊 **Personal Stats** - Track your AI usage
-• ⭐ **Rate Responses** - Help improve AI quality
-• 💬 **Smart Buttons** - Quick access to all features
-• 🔍 **Context Memory** - I remember our conversation
-• 🎯 **Personalized Experience** - Adapts to your preferences
+🎓 **Student Mode** - Homework, explanations, study help
+🎨 **Creative Mode** - Writing, brainstorming, artistic ideas
+💼 **Professional Mode** - Business, strategy, formal communication
+💻 **Coding Mode** - Programming, debugging, technical help
+📺 **Downloader Mode** - Video downloads from social platforms
+🤖 **General Mode** - All-purpose assistance
 
-🚀 **Pro Tips:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📺 **VIDEO DOWNLOADER FEATURES** 📺
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📺 **YouTube** - Download any public video
+🎵 **TikTok** - Save TikTok videos instantly
+📘 **Facebook** - Extract Facebook videos
+📸 **Instagram** - Download Instagram videos
+📊 **Analytics** - Track your download history
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ **INTERACTIVE FEATURES** ✨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 **Personal Stats** - Track your AI usage
+⭐ **Rate Responses** - Help improve AI quality
+💬 **Smart Buttons** - Quick access to all features
+🔍 **Context Memory** - I remember our conversation
+🎯 **Personalized Experience** - Adapts to your preferences
+🎨 **Aesthetic Formatting** - Beautiful, structured responses
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 **PRO TIPS** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 • Try different AI models for different tasks
 • Switch modes based on what you need help with
 • Send video links directly for instant downloads
 • Rate responses to get better personalized service
 • Use specific, detailed questions for best results
 
-💡 **Getting Started:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 **GETTING STARTED** 💡
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 • Just type naturally - I understand context!
 • Use buttons for quick navigation
 • Experiment with different modes and AI models
 • Send video URLs for automatic downloading
 • Ask me to explain anything you don't understand
 
-🌟 **Remember:** I'm here 24/7 to help you achieve amazing things! What would you like to explore first?"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 **Remember:** I'm here 24/7 to help you achieve amazing things! What would you like to explore first?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
         self.send_message_with_buttons(sender_id, help_message)
 
@@ -1599,7 +1815,7 @@ ENHANCED_HOME_HTML = """
     <div class="container">
         <div class="glass-card header">
             <h1>{{ bot_name }}</h1>
-            <p class="subtitle">Version {{ bot_version }} - Next-Generation Multi-AI Assistant with Video Downloader</p>
+            <p class="subtitle">Version {{ bot_version }} - Next-Generation Multi-AI Assistant with Enhanced Aesthetic Responses</p>
             <div class="live-status">
                 <span>🚀</span>
                 <span>Advanced AI System Online 24/7</span>
@@ -1671,10 +1887,10 @@ ENHANCED_HOME_HTML = """
 
                 <div class="feature-card">
                     <div class="feature-icon">🎨</div>
-                    <h3 class="feature-title">Interactive Button Experience</h3>
+                    <h3 class="feature-title">Aesthetic Response Formatting</h3>
                     <p class="feature-desc">
-                        Beautiful, responsive buttons on every AI response. Quick access to model switching, 
-                        mode changes, stats, and features with smooth animations.
+                        Beautiful, structured responses with elegant formatting. Educational content includes 
+                        separated explanations with decorative borders and enhanced readability.
                     </p>
                 </div>
 
@@ -1747,7 +1963,7 @@ ENHANCED_HOME_HTML = """
 
         <div class="glass-card" style="text-align: center; margin-top: 40px;">
             <p style="font-size: 1.1rem; margin-bottom: 12px;">
-                <em>💫 Crafted with ❤️ by SUNNEL | Powered by Advanced Multi-AI Technology + Video Downloader 💫</em>
+                <em>💫 Crafted with ❤️ by SUNNEL | Enhanced with Aesthetic Response Formatting 💫</em>
             </p>
             <p style="font-size: 0.95rem; color: var(--text-secondary);">
                 Last updated: <span id="lastUpdate"></span> | Auto-refresh: 30s
@@ -1925,6 +2141,7 @@ def api_status():
             'real_time_monitoring': True,
             'enhanced_ui': True,
             'video_downloader': True,
+            'aesthetic_formatting': True,
             'supported_platforms': ['YouTube', 'TikTok', 'Facebook', 'Instagram']
         },
         'timestamp': datetime.now().isoformat()
@@ -1970,7 +2187,8 @@ def health_check():
                 'model_switching': True,
                 'specialized_modes': True,
                 'interactive_buttons': True,
-                'video_downloader': True
+                'video_downloader': True,
+                'aesthetic_formatting': True
             },
             'statistics': {
                 'total_users': stats['total_users'] if stats else 0,
@@ -2094,13 +2312,15 @@ def dashboard():
                         <li>✅ Interactive Button Experience</li>
                         <li>✅ Video Downloader (YouTube, TikTok, Facebook, Instagram)</li>
                         <li>✅ Specialized AI Modes</li>
+                        <li>✅ Aesthetic Response Formatting with Decorative Borders</li>
                         <li>✅ Real-time Analytics</li>
                         <li>✅ 24/7 System Monitoring</li>
+                        <li>✅ Enhanced Error Handling</li>
                     </ul>
                 </div>
 
                 <div class="glass-card" style="text-align: center;">
-                    <p><em>💫 Created by SUNNEL | {BOT_NAME} v{BOT_VERSION}</em></p>
+                    <p><em>💫 Created by SUNNEL | {BOT_NAME} v{BOT_VERSION} - Now with Enhanced Aesthetic Responses</em></p>
                     <p style="opacity: 0.7;">Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                 </div>
             </div>
@@ -2125,9 +2345,10 @@ if __name__ == '__main__':
     print(f"🚀 Starting {BOT_NAME} v{BOT_VERSION}")
     print("🌟 ENHANCED FEATURES:")
     print("  • 🔄 AI Model Switching (Gemini ↔ GPT-4 ↔ GPT-3.5)")
-    print("  • 📺 Video Downloader (YouTube, TikTok, Facebook, Instagram)")
+    print("  • 📺 Fixed Video Downloader (YouTube, TikTok, Facebook, Instagram)")
     print("  • 🎯 Interactive Buttons on Every Response")
     print("  • 🎓 Specialized Modes (Student, Creative, Professional, Coding, Downloader)")
+    print("  • 🎨 Aesthetic Response Formatting with Decorative Borders")
     print("  • 📊 Comprehensive User Analytics & Video Stats")
     print("  • ⭐ Response Rating & Feedback System")
     print("  • 🧠 Advanced Conversation Memory")
@@ -2135,10 +2356,12 @@ if __name__ == '__main__':
     print("  • ⚡ Lightning-Fast Performance Optimization")
     print("  • 🔍 Real-time System Monitoring")
     print("  • 💫 Personalized AI Experience")
+    print("  • 🛠️ Enhanced Error Handling & Database Fixes")
     print("\n🔗 Access Points:")
     print("  • 🏠 Home: https://your-repl-url.replit.dev")
     print("  • 📊 Dashboard: https://your-repl-url.replit.dev/dashboard")
     print("  • 🏥 Health: https://your-repl-url.replit.dev/health")
     print("  • 📡 API Status: https://your-repl-url.replit.dev/api/status")
+    print("\n✨ NEW: Beautiful aesthetic responses with decorative formatting!")
 
     app.run(host='0.0.0.0', port=5000, debug=False)
