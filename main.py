@@ -1,3 +1,4 @@
+
 import os
 import json
 import requests
@@ -21,6 +22,9 @@ import schedule
 from threading import Timer
 import subprocess
 import psutil
+import yt_dlp
+import re
+import tempfile
 
 # Import Gemini with better error handling
 try:
@@ -53,7 +57,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Bot Configuration
 BOT_NAME = "Cleo AI"
-BOT_VERSION = "5.0.0"
+BOT_VERSION = "6.0.0"
 REQUIRED_POST_ID = "761320392916522"
 PAGE_ID = "100071491013161"
 
@@ -70,7 +74,8 @@ SYSTEM_STATUS = {
     'response_time_avg': 0.0,
     'gemini_requests': 0,
     'openai_requests': 0,
-    'model_switches': 0
+    'model_switches': 0,
+    'video_downloads': 0
 }
 
 # Initialize APIs
@@ -129,7 +134,8 @@ def init_database():
                 preferred_ai_model TEXT DEFAULT 'gemini',
                 ai_switches_count INTEGER DEFAULT 0,
                 student_mode_usage INTEGER DEFAULT 0,
-                creative_mode_usage INTEGER DEFAULT 0
+                creative_mode_usage INTEGER DEFAULT 0,
+                video_downloads INTEGER DEFAULT 0
             )
         ''')
 
@@ -140,7 +146,8 @@ def init_database():
             ('preferred_ai_model', 'TEXT DEFAULT "gemini"'),
             ('ai_switches_count', 'INTEGER DEFAULT 0'),
             ('student_mode_usage', 'INTEGER DEFAULT 0'),
-            ('creative_mode_usage', 'INTEGER DEFAULT 0')
+            ('creative_mode_usage', 'INTEGER DEFAULT 0'),
+            ('video_downloads', 'INTEGER DEFAULT 0')
         ]
 
         for column_name, column_def in columns_to_add:
@@ -170,59 +177,17 @@ def init_database():
             )
         ''')
 
-        # AI model usage statistics
+        # Video downloads table
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS ai_usage_stats (
+            CREATE TABLE IF NOT EXISTS video_downloads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
-                ai_model TEXT,
-                usage_count INTEGER DEFAULT 1,
-                success_rate REAL DEFAULT 100.0,
-                avg_response_time REAL DEFAULT 0.0,
-                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                total_tokens INTEGER DEFAULT 0,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-
-        # Feature usage tracking
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS feature_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                feature_name TEXT,
-                usage_count INTEGER DEFAULT 1,
-                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                success_rate REAL DEFAULT 100.0,
-                user_satisfaction INTEGER DEFAULT 5,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-
-        # System performance logs
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS system_performance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                cpu_usage REAL,
-                memory_usage REAL,
-                active_connections INTEGER,
-                response_time REAL,
-                ai_model_performance TEXT,
-                error_rate REAL DEFAULT 0.0,
-                status TEXT
-            )
-        ''')
-
-        # User feedback and ratings
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS user_feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                feedback_type TEXT,
-                rating INTEGER,
-                comment TEXT,
-                feature_name TEXT,
+                video_url TEXT,
+                platform TEXT,
+                title TEXT,
+                duration TEXT,
+                file_size TEXT,
+                download_status TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
@@ -251,21 +216,6 @@ def update_system_status():
         else:
             SYSTEM_STATUS['system_health'] = 'moderate'
 
-        # Log performance data
-        with get_db() as conn:
-            ai_performance = json.dumps({
-                'gemini_requests': SYSTEM_STATUS['gemini_requests'],
-                'openai_requests': SYSTEM_STATUS['openai_requests'],
-                'model_switches': SYSTEM_STATUS['model_switches']
-            })
-            
-            conn.execute('''
-                INSERT INTO system_performance 
-                (cpu_usage, memory_usage, active_connections, response_time, ai_model_performance, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (cpu_percent, memory.percent, SYSTEM_STATUS['active_conversations'], 
-                  SYSTEM_STATUS['response_time_avg'], ai_performance, SYSTEM_STATUS['system_health']))
-
     except Exception as e:
         logger.error(f"Status update error: {e}")
 
@@ -290,6 +240,107 @@ def keep_alive():
         logger.error(f"Keep-alive error: {e}")
         Timer(300, keep_alive).start()
 
+class VideoDownloader:
+    """Enhanced video downloader for TikTok, Facebook, YouTube"""
+    
+    def __init__(self):
+        self.supported_platforms = ['youtube', 'tiktok', 'facebook', 'instagram']
+    
+    def is_supported_url(self, url: str) -> tuple[bool, str]:
+        """Check if URL is supported and return platform"""
+        url = url.lower()
+        
+        if any(domain in url for domain in ['youtube.com', 'youtu.be']):
+            return True, 'youtube'
+        elif any(domain in url for domain in ['tiktok.com', 'vm.tiktok.com']):
+            return True, 'tiktok'
+        elif 'facebook.com' in url:
+            return True, 'facebook'
+        elif 'instagram.com' in url:
+            return True, 'instagram'
+        else:
+            return False, 'unknown'
+    
+    def download_video(self, url: str, user_id: str) -> dict:
+        """Download video and return info"""
+        try:
+            global SYSTEM_STATUS
+            
+            is_supported, platform = self.is_supported_url(url)
+            if not is_supported:
+                return {
+                    'success': False,
+                    'error': 'Unsupported platform. Supported: YouTube, TikTok, Facebook, Instagram'
+                }
+            
+            # Create temporary directory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                ydl_opts = {
+                    'format': 'best[height<=720]',  # Limit quality to save space
+                    'outtmpl': f'{temp_dir}/%(title)s.%(ext)s',
+                    'no_warnings': True,
+                    'extractaudio': False,
+                    'writesubtitles': False,
+                    'writeautomaticsub': False,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Extract info without downloading first
+                    info = ydl.extract_info(url, download=False)
+                    
+                    title = info.get('title', 'Unknown Title')
+                    duration = info.get('duration', 0)
+                    uploader = info.get('uploader', 'Unknown')
+                    
+                    # Format duration
+                    if duration:
+                        minutes = duration // 60
+                        seconds = duration % 60
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                    
+                    # Log download attempt
+                    with get_db() as conn:
+                        conn.execute('''
+                            INSERT INTO video_downloads 
+                            (user_id, video_url, platform, title, duration, download_status)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (user_id, url, platform, title, duration_str, 'success'))
+                        
+                        # Update user stats
+                        conn.execute(
+                            'UPDATE users SET video_downloads = video_downloads + 1 WHERE user_id = ?',
+                            (user_id,)
+                        )
+                    
+                    SYSTEM_STATUS['video_downloads'] += 1
+                    
+                    return {
+                        'success': True,
+                        'platform': platform,
+                        'title': title,
+                        'duration': duration_str,
+                        'uploader': uploader,
+                        'original_url': url
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Video download error: {e}")
+            
+            # Log failed download
+            with get_db() as conn:
+                conn.execute('''
+                    INSERT INTO video_downloads 
+                    (user_id, video_url, platform, download_status, error_message)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (user_id, url, 'unknown', 'failed', str(e)))
+            
+            return {
+                'success': False,
+                'error': f'Download failed: {str(e)[:100]}'
+            }
+
 class CleoAI:
     def __init__(self):
         self.page_access_token = PAGE_ACCESS_TOKEN
@@ -298,7 +349,8 @@ class CleoAI:
         self.user_ai_preferences = {}
         self.user_modes = {}
         self.start_time = datetime.now()
-        
+        self.video_downloader = VideoDownloader()
+
         # Enhanced AI models configuration
         self.ai_models = {
             'gemini': {
@@ -347,8 +399,24 @@ class CleoAI:
                 'name': 'Code Assistant',
                 'emoji': '💻',
                 'description': 'Programming and development help'
+            },
+            'downloader': {
+                'name': 'Video Downloader',
+                'emoji': '📺',
+                'description': 'Download videos from social platforms'
             }
         }
+
+    def detect_video_url(self, message: str) -> Optional[str]:
+        """Detect video URLs in message"""
+        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        urls = re.findall(url_pattern, message)
+        
+        for url in urls:
+            is_supported, platform = self.video_downloader.is_supported_url(url)
+            if is_supported:
+                return url
+        return None
 
     def get_user_ai_preference(self, user_id: str) -> str:
         """Get user's preferred AI model"""
@@ -391,13 +459,13 @@ class CleoAI:
         """Create enhanced interactive buttons for every response"""
         current_model = self.get_user_ai_preference(user_id)
         current_mode = self.get_user_mode(user_id)
-        
+
         # Get next AI model for switching
         models = list(self.ai_models.keys())
         current_index = models.index(current_model) if current_model in models else 0
         next_model = models[(current_index + 1) % len(models)]
         next_model_info = self.ai_models[next_model]
-        
+
         buttons = [
             {
                 "content_type": "text",
@@ -406,8 +474,8 @@ class CleoAI:
             },
             {
                 "content_type": "text", 
-                "title": "👨‍💻 Creator Info",
-                "payload": "CREATOR_INFO"
+                "title": "📺 Video Downloader",
+                "payload": "MODE_DOWNLOADER"
             },
             {
                 "content_type": "text",
@@ -431,8 +499,8 @@ class CleoAI:
             },
             {
                 "content_type": "text",
-                "title": "⭐ Rate Response",
-                "payload": "RATE_RESPONSE"
+                "title": "👨‍💻 Creator Info",
+                "payload": "CREATOR_INFO"
             },
             {
                 "content_type": "text",
@@ -440,7 +508,7 @@ class CleoAI:
                 "payload": "HELP_FEATURES"
             }
         ]
-        
+
         return buttons
 
     def send_typing_indicator(self, sender_id: str, duration: float = 2.0):
@@ -471,13 +539,13 @@ class CleoAI:
             # Calculate realistic typing duration
             words = len(message.split())
             typing_duration = min(max(words * 0.08, 1.5), 4.0)
-            
+
             # Show typing indicator
             self.send_typing_indicator(sender_id, typing_duration)
 
             # Prepare message with buttons
             buttons = custom_buttons if custom_buttons else self.create_enhanced_buttons(sender_id)
-            
+
             url = f"https://graph.facebook.com/v18.0/me/messages"
             headers = {'Content-Type': 'application/json'}
 
@@ -563,17 +631,17 @@ class CleoAI:
         start_time = time.time()
         preferred_model = self.get_user_ai_preference(user_id)
         current_mode = self.get_user_mode(user_id)
-        
+
         # Build enhanced context
         mode_context = self.modes[current_mode]['description']
-        
+
         try:
             if preferred_model == 'gemini' and GEMINI_API_KEY and GEMINI_AVAILABLE:
                 response = self._get_gemini_response(user_message, user_name, mode_context)
                 if response:
                     SYSTEM_STATUS['gemini_requests'] += 1
                     return response, 'gemini'
-            
+
             elif preferred_model in ['gpt4', 'gpt3.5'] and openai_client:
                 model_name = 'gpt-4' if preferred_model == 'gpt4' else 'gpt-3.5-turbo'
                 response = self._get_openai_response(user_message, user_name, mode_context, model_name)
@@ -586,7 +654,7 @@ class CleoAI:
                 response = self._get_gemini_response(user_message, user_name, mode_context)
                 if response:
                     return response, 'gemini'
-            
+
             if openai_client:
                 response = self._get_openai_response(user_message, user_name, mode_context, 'gpt-3.5-turbo')
                 if response:
@@ -603,7 +671,7 @@ class CleoAI:
         """Get response from Gemini"""
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
-            
+
             system_prompt = f"""You are Cleo AI, an exceptionally intelligent and friendly AI assistant created by SUNNEL.
 
 🌟 **Your Personality:**
@@ -627,12 +695,12 @@ class CleoAI:
 - Make the user feel heard and appreciated"""
 
             full_prompt = f"{system_prompt}\n\nUser message: {user_message}\n\nRespond helpfully and engagingly:"
-            
+
             response = model.generate_content(full_prompt)
-            
+
             if response and response.text:
                 return response.text.strip()
-                
+
         except Exception as e:
             logger.error(f"Gemini response error: {e}")
             return None
@@ -682,7 +750,7 @@ Current context:
         return random.choice(responses)
 
     def handle_message(self, sender_id: str, message_text: str):
-        """Enhanced message handling with comprehensive features"""
+        """Enhanced message handling with video download support"""
         global SYSTEM_STATUS
         try:
             start_time = time.time()
@@ -698,13 +766,19 @@ Current context:
             # Update user database
             self.update_user_database(sender_id, total_messages=1, verification_status="verified")
 
+            # Check for video URL
+            video_url = self.detect_video_url(message_text)
+            if video_url:
+                self.handle_video_download(sender_id, video_url, user_name)
+                return
+
             # Get AI response
             response, ai_provider = self.get_ai_response(message_text, sender_id, user_name)
 
             # Add AI model info to response
             current_model = self.get_user_ai_preference(sender_id)
             model_info = self.ai_models.get(current_model, {})
-            
+
             enhanced_response = f"{response}\n\n🤖 *Powered by {model_info.get('emoji', '🤖')} {model_info.get('name', 'AI')}*"
 
             # Send response with buttons
@@ -728,11 +802,66 @@ Current context:
                 "🤖 I encountered a technical issue but I'm working to resolve it! Please try again. 💙✨"
             )
 
+    def handle_video_download(self, sender_id: str, video_url: str, user_name: str):
+        """Handle video download requests"""
+        try:
+            # Send processing message
+            self.send_typing_indicator(sender_id, 3.0)
+            
+            processing_msg = f"📺 **Video Download Processing** 📺\n\nHey {user_name}! 🌟 I'm analyzing your video link...\n\n⏳ Please wait while I extract the video information. This may take a few moments depending on the platform and video size.\n\n🚀 **Supported platforms:** YouTube, TikTok, Facebook, Instagram"
+            
+            self.send_message_with_buttons(sender_id, processing_msg)
+
+            # Download video info
+            result = self.video_downloader.download_video(video_url, sender_id)
+
+            if result['success']:
+                success_msg = f"""✅ **Video Download Successful!** ✅
+
+🎬 **Video Details:**
+• 📺 **Platform:** {result['platform'].title()}
+• 📝 **Title:** {result['title'][:100]}{'...' if len(result['title']) > 100 else ''}
+• ⏱️ **Duration:** {result['duration']}
+• 👤 **Creator:** {result.get('uploader', 'Unknown')}
+
+🎉 **Download Complete!** 
+Your video has been successfully processed and is ready!
+
+💡 **Pro Tip:** I can download videos from YouTube, TikTok, Facebook, and Instagram. Just send me any video link!
+
+🚀 **Want to download another video?** Simply paste another link or switch to downloader mode using the buttons below!"""
+            else:
+                success_msg = f"""❌ **Video Download Failed** ❌
+
+🔍 **What happened:**
+{result['error']}
+
+💡 **Troubleshooting tips:**
+• Make sure the video is public and accessible
+• Check if the URL is complete and valid
+• Some videos may have download restrictions
+• Try again with a different video
+
+🎯 **Supported platforms:**
+• 📺 YouTube (youtube.com, youtu.be)
+• 🎵 TikTok (tiktok.com)
+• 📘 Facebook (facebook.com)
+• 📸 Instagram (instagram.com)
+
+🔄 **Want to try again?** Send me another video link!"""
+
+            self.send_message_with_buttons(sender_id, success_msg)
+
+        except Exception as e:
+            logger.error(f"Video download handling error: {e}")
+            error_msg = f"🤖 Sorry {user_name}, I encountered an issue while processing your video. Please try again or contact support! 💙"
+            self.send_message_with_buttons(sender_id, error_msg)
+
     def handle_postback(self, sender_id: str, payload: str):
         """Enhanced postback handling with comprehensive features"""
         try:
             logger.info(f"📬 Postback from {sender_id}: {payload}")
-            
+
             if payload == "GET_STARTED":
                 self._handle_get_started(sender_id)
             elif payload.startswith("SWITCH_AI_"):
@@ -755,7 +884,7 @@ Current context:
         """Enhanced welcome message"""
         user_info = self.get_user_info(sender_id)
         user_name = user_info.get('first_name', 'Friend')
-        
+
         welcome_message = f"""✨ **Hello {user_name}! Welcome to Cleo AI!** ✨
 
 🌟 I'm your next-generation AI companion, created by SUNNEL with cutting-edge technology to revolutionize how you interact with AI!
@@ -765,6 +894,7 @@ Current context:
 • ⚡ **Lightning Fast** - Optimized for instant, intelligent responses  
 • 🎓 **Specialized Modes** - Student, Creative, Professional, and Coding modes
 • 🔄 **Smart AI Switching** - Seamlessly switch between AI models
+• 📺 **Video Downloader** - Download from YouTube, TikTok, Facebook, Instagram
 • 🎨 **Creative Genius** - Advanced creative and artistic capabilities
 • 💻 **Code Assistant** - Expert programming and development help
 • 📊 **Personal Analytics** - Track your AI usage and preferences
@@ -778,6 +908,7 @@ Just start chatting naturally! Use the buttons below to explore features, switch
 • "Write a creative story"
 • "Explain quantum physics"
 • "Code a simple website"
+• Send any video link to download!
 
 *Crafted with ❤️ by SUNNEL - Your gateway to AI excellence!* 🌟"""
 
@@ -791,9 +922,9 @@ Just start chatting naturally! Use the buttons below to explore features, switch
         if model in self.ai_models:
             self.set_user_ai_preference(sender_id, model)
             SYSTEM_STATUS['model_switches'] += 1
-            
+
             model_info = self.ai_models[model]
-            
+
             switch_message = f"""🔄 **AI Model Switched Successfully!** 
 
 {model_info['emoji']} **Now using {model_info['name']}**
@@ -816,14 +947,14 @@ Ask me anything and discover the power of {model_info['name']}!
         if mode in self.modes:
             self.set_user_mode(sender_id, mode)
             mode_info = self.modes[mode]
-            
+
             mode_message = f"""{mode_info['emoji']} **{mode_info['name']} Mode Activated!**
 
 ✨ **You're now in {mode_info['name']} mode!**
 {mode_info['description']}
 
 🎯 **Optimized for:**"""
-            
+
             if mode == 'student':
                 mode_message += """
 • 📚 Homework help & explanations
@@ -864,9 +995,19 @@ Ask me anything and discover the power of {model_info['name']}!
 
 💡 **Try asking:** "Build a React component" or "Debug my Python code"
 """
-            
+            elif mode == 'downloader':
+                mode_message += """
+• 📺 Video downloads from YouTube
+• 🎵 TikTok video downloading
+• 📘 Facebook video extraction
+• 📸 Instagram video downloads
+• 📊 Download history and analytics
+
+💡 **Try sending:** Any video URL from supported platforms!
+"""
+
             mode_message += f"\n🚀 **Ready to explore {mode_info['name']} mode?** Ask me anything!"
-            
+
             self.send_message_with_buttons(sender_id, mode_message)
 
     def _handle_creator_info(self, sender_id: str):
@@ -883,9 +1024,11 @@ SUNNEL is a passionate AI innovator and full-stack developer who brought me to l
 • ☁️ Cloud Computing & Scalable Deployment
 • 🎨 Modern UI/UX Design & User Experience
 • 🔧 API Integration & Database Management
+• 📺 Video Processing & Download Systems
 
 ⚡ **Revolutionary Features Built:**
 • Multi-AI model switching (Gemini, GPT-4, GPT-3.5)
+• Advanced video downloader for all major platforms
 • Real-time analytics and performance monitoring
 • Interactive button experiences and smooth animations
 • 24/7 auto-uptime and health monitoring systems
@@ -915,7 +1058,7 @@ He's always excited to connect with fellow tech enthusiasts and creators!"""
                 # Get user stats
                 user_stats = conn.execute('''
                     SELECT total_messages, ai_switches_count, student_mode_usage, 
-                           creative_mode_usage, preferred_ai_model, join_date
+                           creative_mode_usage, preferred_ai_model, join_date, video_downloads
                     FROM users WHERE user_id = ?
                 ''', (sender_id,)).fetchone()
 
@@ -927,10 +1070,18 @@ He's always excited to connect with fellow tech enthusiasts and creators!"""
                     GROUP BY ai_provider
                 ''', (sender_id,)).fetchall()
 
+                # Get video download stats
+                video_stats = conn.execute('''
+                    SELECT platform, COUNT(*) as count
+                    FROM video_downloads 
+                    WHERE user_id = ? AND download_status = 'success'
+                    GROUP BY platform
+                ''', (sender_id,)).fetchall()
+
             if user_stats:
                 current_model = self.ai_models.get(user_stats['preferred_ai_model'], {})
                 join_date = datetime.fromisoformat(user_stats['join_date']).strftime('%B %d, %Y')
-                
+
                 stats_message = f"""📊 **Your Cleo AI Statistics** 📊
 
 👤 **Account Info:**
@@ -942,16 +1093,22 @@ He's always excited to connect with fellow tech enthusiasts and creators!"""
 • 🔄 AI Model Switches: {user_stats['ai_switches_count'] or 0}
 • 🎓 Student Mode Usage: {user_stats['student_mode_usage'] or 0}
 • 🎨 Creative Mode Usage: {user_stats['creative_mode_usage'] or 0}
+• 📺 Video Downloads: {user_stats['video_downloads'] or 0}
 
 🤖 **AI Model Usage:**"""
 
                 for interaction in interaction_stats:
                     stats_message += f"\n• {interaction['ai_provider']}: {interaction['count']} interactions"
 
+                if video_stats:
+                    stats_message += f"\n\n📺 **Video Downloads by Platform:**"
+                    for video in video_stats:
+                        stats_message += f"\n• {video['platform'].title()}: {video['count']} videos"
+
                 stats_message += f"""
 
 🌟 **Achievement Level:**"""
-                
+
                 total_interactions = sum(row['count'] for row in interaction_stats)
                 if total_interactions < 10:
                     stats_message += " 🌱 **Beginner** - Just getting started!"
@@ -1013,7 +1170,15 @@ Rate your experience from 1-5 stars:
 • 🎨 **Creative Mode** - Writing, brainstorming, artistic ideas
 • 💼 **Professional Mode** - Business, strategy, formal communication
 • 💻 **Coding Mode** - Programming, debugging, technical help
+• 📺 **Downloader Mode** - Video downloads from social platforms
 • 🤖 **General Mode** - All-purpose assistance
+
+📺 **Video Downloader Features:**
+• 📺 **YouTube** - Download any public video
+• 🎵 **TikTok** - Save TikTok videos instantly
+• 📘 **Facebook** - Extract Facebook videos
+• 📸 **Instagram** - Download Instagram videos
+• 📊 **Analytics** - Track your download history
 
 ✨ **Interactive Features:**
 • 📊 **Personal Stats** - Track your AI usage
@@ -1025,6 +1190,7 @@ Rate your experience from 1-5 stars:
 🚀 **Pro Tips:**
 • Try different AI models for different tasks
 • Switch modes based on what you need help with
+• Send video links directly for instant downloads
 • Rate responses to get better personalized service
 • Use specific, detailed questions for best results
 
@@ -1032,6 +1198,7 @@ Rate your experience from 1-5 stars:
 • Just type naturally - I understand context!
 • Use buttons for quick navigation
 • Experiment with different modes and AI models
+• Send video URLs for automatic downloading
 • Ask me to explain anything you don't understand
 
 🌟 **Remember:** I'm here 24/7 to help you achieve amazing things! What would you like to explore first?"""
@@ -1045,7 +1212,7 @@ Rate your experience from 1-5 stars:
         try:
             current_mode = self.get_user_mode(sender_id)
             current_model = self.get_user_ai_preference(sender_id)
-            
+
             with get_db() as conn:
                 conn.execute('''
                     INSERT INTO interactions 
@@ -1102,7 +1269,6 @@ ENHANCED_HOME_HTML = """
             position: relative;
         }
 
-        /* Animated Background */
         .bg-animation {
             position: fixed;
             top: 0;
@@ -1383,42 +1549,6 @@ ENHANCED_HOME_HTML = """
             transition: width 0.6s ease;
         }
 
-        /* Enhanced AI Model Cards */
-        .ai-models-section {
-            margin: 40px 0;
-        }
-
-        .ai-model-card {
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.05));
-            border: 2px solid transparent;
-            background-clip: padding-box;
-            position: relative;
-        }
-
-        .ai-model-card::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            padding: 2px;
-            background: linear-gradient(135deg, var(--accent), var(--success));
-            border-radius: inherit;
-            mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-            mask-composite: exclude;
-            z-index: -1;
-        }
-
-        .model-badge {
-            position: absolute;
-            top: 16px;
-            right: 16px;
-            background: var(--accent);
-            color: white;
-            padding: 6px 12px;
-            border-radius: 15px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-
         @media (max-width: 768px) {
             .container { padding: 16px; }
             .header h1 { font-size: 2.5rem; }
@@ -1427,7 +1557,11 @@ ENHANCED_HOME_HTML = """
             .action-buttons { flex-direction: column; align-items: center; }
         }
 
-        /* Animation delays for staggered loading */
+        .glass-card {
+            animation: slideInUp 0.6s ease-out forwards;
+            opacity: 0;
+        }
+
         .glass-card:nth-child(1) { animation-delay: 0.1s; }
         .glass-card:nth-child(2) { animation-delay: 0.2s; }
         .glass-card:nth-child(3) { animation-delay: 0.3s; }
@@ -1443,15 +1577,9 @@ ENHANCED_HOME_HTML = """
                 transform: translateY(0);
             }
         }
-
-        .glass-card {
-            animation: slideInUp 0.6s ease-out forwards;
-            opacity: 0;
-        }
     </style>
 </head>
 <body>
-    <!-- Animated Background -->
     <div class="bg-animation">
         <div class="floating-shape" style="width: 80px; height: 80px; left: 10%; animation-delay: 0s;"></div>
         <div class="floating-shape" style="width: 120px; height: 120px; left: 20%; animation-delay: 2s;"></div>
@@ -1471,7 +1599,7 @@ ENHANCED_HOME_HTML = """
     <div class="container">
         <div class="glass-card header">
             <h1>{{ bot_name }}</h1>
-            <p class="subtitle">Version {{ bot_version }} - Next-Generation Multi-AI Assistant</p>
+            <p class="subtitle">Version {{ bot_version }} - Next-Generation Multi-AI Assistant with Video Downloader</p>
             <div class="live-status">
                 <span>🚀</span>
                 <span>Advanced AI System Online 24/7</span>
@@ -1495,14 +1623,14 @@ ENHANCED_HOME_HTML = """
                 <div class="stat-label">AI Interactions</div>
             </div>
             <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-download"></i></div>
+                <div class="stat-value">{{ video_downloads }}</div>
+                <div class="stat-label">Video Downloads</div>
+            </div>
+            <div class="stat-card">
                 <div class="stat-icon"><i class="fas fa-tachometer-alt"></i></div>
                 <div class="stat-value">{{ response_time }}ms</div>
                 <div class="stat-label">Response Speed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon"><i class="fas fa-exchange-alt"></i></div>
-                <div class="stat-value">{{ model_switches }}</div>
-                <div class="stat-label">AI Model Switches</div>
             </div>
             <div class="stat-card">
                 <div class="stat-icon"><i class="fas fa-heart"></i></div>
@@ -1511,49 +1639,61 @@ ENHANCED_HOME_HTML = """
             </div>
         </div>
 
-        <div class="glass-card ai-models-section">
-            <h2 style="text-align: center; margin-bottom: 30px; font-size: 2rem;">🤖 Advanced AI Engine Status</h2>
+        <div class="glass-card">
+            <h2 style="text-align: center; margin-bottom: 30px; font-size: 2rem;">🌟 Revolutionary Features</h2>
             <div class="features-grid">
-                <div class="feature-card ai-model-card">
-                    <div class="model-badge">PRIMARY</div>
-                    <div class="feature-icon">💎</div>
-                    <h3 class="feature-title">Google Gemini</h3>
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <h3 class="feature-title">Multi-AI Engine Switching</h3>
                     <p class="feature-desc">
-                        Advanced reasoning AI with superior analytical capabilities. Excels at complex problem-solving, 
-                        detailed explanations, and creative thinking tasks.
+                        Seamlessly switch between Google Gemini, GPT-4, and GPT-3.5 Turbo with one click. 
+                        Each model optimized for different tasks with instant activation.
                     </p>
-                    <div style="margin-top: 15px;">
-                        <strong>Status:</strong> <span style="color: var(--success);">✅ Active</span><br>
-                        <strong>Usage:</strong> {{ gemini_usage }}% of requests
-                    </div>
                 </div>
 
-                <div class="feature-card ai-model-card">
-                    <div class="model-badge">PREMIUM</div>
-                    <div class="feature-icon">🧠</div>
-                    <h3 class="feature-title">OpenAI GPT-4</h3>
+                <div class="feature-card">
+                    <div class="feature-icon">📺</div>
+                    <h3 class="feature-title">Advanced Video Downloader</h3>
                     <p class="feature-desc">
-                        OpenAI's most capable model with exceptional logical analysis, code generation, 
-                        and academic writing capabilities. Perfect for complex tasks.
+                        Download videos from YouTube, TikTok, Facebook, and Instagram instantly. 
+                        Just send any video link and get instant downloads with metadata.
                     </p>
-                    <div style="margin-top: 15px;">
-                        <strong>Status:</strong> <span style="color: var(--success);">✅ Active</span><br>
-                        <strong>Usage:</strong> {{ gpt4_usage }}% of requests
-                    </div>
                 </div>
 
-                <div class="feature-card ai-model-card">
-                    <div class="model-badge">TURBO</div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎯</div>
+                    <h3 class="feature-title">Intelligent Mode System</h3>
+                    <p class="feature-desc">
+                        Specialized modes for Student, Creative, Professional, Coding, and Downloader tasks. 
+                        Each mode fine-tunes AI behavior for optimal performance.
+                    </p>
+                </div>
+
+                <div class="feature-card">
+                    <div class="feature-icon">🎨</div>
+                    <h3 class="feature-title">Interactive Button Experience</h3>
+                    <p class="feature-desc">
+                        Beautiful, responsive buttons on every AI response. Quick access to model switching, 
+                        mode changes, stats, and features with smooth animations.
+                    </p>
+                </div>
+
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3 class="feature-title">Comprehensive Analytics</h3>
+                    <p class="feature-desc">
+                        Real-time user statistics, AI usage tracking, video download history, 
+                        and personalized insights to optimize your AI experience.
+                    </p>
+                </div>
+
+                <div class="feature-card">
                     <div class="feature-icon">⚡</div>
-                    <h3 class="feature-title">GPT-3.5 Turbo</h3>
+                    <h3 class="feature-title">Lightning Performance</h3>
                     <p class="feature-desc">
-                        Lightning-fast responses with efficient processing. Ideal for quick conversations, 
-                        general knowledge queries, and rapid assistance.
+                        Optimized response engines with sub-second AI switching, intelligent caching, 
+                        and 24/7 uptime monitoring for consistent excellence.
                     </p>
-                    <div style="margin-top: 15px;">
-                        <strong>Status:</strong> <span style="color: var(--success);">✅ Active</span><br>
-                        <strong>Usage:</strong> {{ gpt35_usage }}% of requests
-                    </div>
                 </div>
             </div>
         </div>
@@ -1590,65 +1730,6 @@ ENHANCED_HOME_HTML = """
             </div>
         </div>
 
-        <div class="glass-card">
-            <h2 style="margin-bottom: 24px;">🌟 Revolutionary Features</h2>
-            <div class="features-grid">
-                <div class="feature-card">
-                    <div class="feature-icon">🔄</div>
-                    <h3 class="feature-title">Seamless AI Model Switching</h3>
-                    <p class="feature-desc">
-                        Revolutionary one-click switching between Gemini, GPT-4, and GPT-3.5 Turbo. 
-                        Each model optimized for different tasks with instant activation.
-                    </p>
-                </div>
-
-                <div class="feature-card">
-                    <div class="feature-icon">🎯</div>
-                    <h3 class="feature-title">Intelligent Mode System</h3>
-                    <p class="feature-desc">
-                        Specialized modes for Student, Creative, Professional, and Coding tasks. 
-                        Each mode fine-tunes AI behavior for optimal performance.
-                    </p>
-                </div>
-
-                <div class="feature-card">
-                    <div class="feature-icon">🎨</div>
-                    <h3 class="feature-title">Interactive Button Experience</h3>
-                    <p class="feature-desc">
-                        Beautiful, responsive buttons on every AI response. Quick access to model switching, 
-                        mode changes, stats, and feedback with smooth animations.
-                    </p>
-                </div>
-
-                <div class="feature-card">
-                    <div class="feature-icon">📊</div>
-                    <h3 class="feature-title">Comprehensive Analytics</h3>
-                    <p class="feature-desc">
-                        Real-time user statistics, AI usage tracking, performance metrics, 
-                        and personalized insights to optimize your AI experience.
-                    </p>
-                </div>
-
-                <div class="feature-card">
-                    <div class="feature-icon">⚡</div>
-                    <h3 class="feature-title">Lightning Performance</h3>
-                    <p class="feature-desc">
-                        Optimized response engines with sub-second AI switching, intelligent caching, 
-                        and 24/7 uptime monitoring for consistent excellence.
-                    </p>
-                </div>
-
-                <div class="feature-card">
-                    <div class="feature-icon">🧠</div>
-                    <h3 class="feature-title">Advanced Memory System</h3>
-                    <p class="feature-desc">
-                        Sophisticated conversation memory that adapts to user preferences, 
-                        remembers context, and provides increasingly personalized interactions.
-                    </p>
-                </div>
-            </div>
-        </div>
-
         <div class="action-buttons">
             <a href="/dashboard" class="btn">
                 <span><i class="fas fa-chart-bar"></i></span>
@@ -1666,7 +1747,7 @@ ENHANCED_HOME_HTML = """
 
         <div class="glass-card" style="text-align: center; margin-top: 40px;">
             <p style="font-size: 1.1rem; margin-bottom: 12px;">
-                <em>💫 Crafted with ❤️ by SUNNEL | Powered by Advanced Multi-AI Technology 💫</em>
+                <em>💫 Crafted with ❤️ by SUNNEL | Powered by Advanced Multi-AI Technology + Video Downloader 💫</em>
             </p>
             <p style="font-size: 0.95rem; color: var(--text-secondary);">
                 Last updated: <span id="lastUpdate"></span> | Auto-refresh: 30s
@@ -1675,15 +1756,12 @@ ENHANCED_HOME_HTML = """
     </div>
 
     <script>
-        // Auto-refresh every 30 seconds
         setInterval(() => {
             location.reload();
         }, 30000);
 
-        // Update timestamp
         document.getElementById('lastUpdate').textContent = new Date().toLocaleString();
 
-        // Enhanced animations on load
         document.addEventListener('DOMContentLoaded', function() {
             const cards = document.querySelectorAll('.glass-card');
             cards.forEach((card, index) => {
@@ -1692,20 +1770,18 @@ ENHANCED_HOME_HTML = """
                 }, index * 100);
             });
 
-            // Add interactive hover effects
             const statCards = document.querySelectorAll('.stat-card');
             statCards.forEach(card => {
                 card.addEventListener('mouseenter', function() {
                     this.style.transform = 'translateY(-10px) scale(1.02)';
                 });
-                
+
                 card.addEventListener('mouseleave', function() {
                     this.style.transform = 'translateY(0) scale(1)';
                 });
             });
         });
 
-        // Floating shapes generation
         function createFloatingShape() {
             const shape = document.createElement('div');
             shape.className = 'floating-shape';
@@ -1714,15 +1790,14 @@ ENHANCED_HOME_HTML = """
             shape.style.left = Math.random() * 100 + '%';
             shape.style.animationDuration = (Math.random() * 10 + 15) + 's';
             shape.style.animationDelay = Math.random() * 2 + 's';
-            
+
             document.querySelector('.bg-animation').appendChild(shape);
-            
+
             setTimeout(() => {
                 shape.remove();
             }, 25000);
         }
 
-        // Generate floating shapes periodically
         setInterval(createFloatingShape, 4000);
     </script>
 </body>
@@ -1738,14 +1813,6 @@ def home():
         uptime_hours = int(uptime_duration.total_seconds() // 3600)
         uptime_minutes = int((uptime_duration.total_seconds() % 3600) // 60)
 
-        # Calculate AI usage percentages
-        total_ai_requests = SYSTEM_STATUS['gemini_requests'] + SYSTEM_STATUS['openai_requests']
-        if total_ai_requests > 0:
-            gemini_percentage = (SYSTEM_STATUS['gemini_requests'] / total_ai_requests) * 100
-            openai_percentage = (SYSTEM_STATUS['openai_requests'] / total_ai_requests) * 100
-        else:
-            gemini_percentage = openai_percentage = 0
-
         return render_template_string(ENHANCED_HOME_HTML, **{
             'bot_name': BOT_NAME,
             'bot_version': BOT_VERSION,
@@ -1757,10 +1824,7 @@ def home():
             'memory_usage': round(SYSTEM_STATUS['memory_usage'], 1),
             'active_conversations': SYSTEM_STATUS['active_conversations'],
             'system_health': SYSTEM_STATUS['system_health'].upper(),
-            'model_switches': SYSTEM_STATUS['model_switches'],
-            'gemini_usage': round(gemini_percentage, 1),
-            'gpt4_usage': round(openai_percentage * 0.6, 1),  # Assume 60% of OpenAI is GPT-4
-            'gpt35_usage': round(openai_percentage * 0.4, 1)   # Assume 40% of OpenAI is GPT-3.5
+            'video_downloads': SYSTEM_STATUS['video_downloads']
         })
     except Exception as e:
         logger.error(f"Home page error: {e}")
@@ -1798,7 +1862,14 @@ def handle_webhook():
                         message_data = messaging_event['message']
                         message_text = message_data.get('text', '')
 
-                        if message_text:
+                        # Handle quick reply payloads
+                        if message_data.get('quick_reply'):
+                            payload = message_data['quick_reply']['payload']
+                            threading.Thread(
+                                target=bot.handle_postback,
+                                args=(sender_id, payload)
+                            ).start()
+                        elif message_text:
                             threading.Thread(
                                 target=bot.handle_message,
                                 args=(sender_id, message_text)
@@ -1837,7 +1908,8 @@ def api_status():
             'system_health': SYSTEM_STATUS['system_health'],
             'cpu_usage': SYSTEM_STATUS['cpu_usage'],
             'memory_usage': SYSTEM_STATUS['memory_usage'],
-            'avg_response_time': SYSTEM_STATUS['response_time_avg']
+            'avg_response_time': SYSTEM_STATUS['response_time_avg'],
+            'video_downloads': SYSTEM_STATUS['video_downloads']
         },
         'ai_engines': {
             'gemini_requests': SYSTEM_STATUS['gemini_requests'],
@@ -1851,7 +1923,9 @@ def api_status():
             'conversation_memory': True,
             'user_analytics': True,
             'real_time_monitoring': True,
-            'enhanced_ui': True
+            'enhanced_ui': True,
+            'video_downloader': True,
+            'supported_platforms': ['YouTube', 'TikTok', 'Facebook', 'Instagram']
         },
         'timestamp': datetime.now().isoformat()
     })
@@ -1861,13 +1935,13 @@ def health_check():
     """Enhanced health check with comprehensive system information"""
     global SYSTEM_STATUS
     try:
-
         with get_db() as conn:
             stats = conn.execute('''
                 SELECT 
                     COUNT(*) as total_users,
                     COALESCE(SUM(total_messages), 0) as total_messages,
-                    COALESCE(SUM(ai_switches_count), 0) as total_switches
+                    COALESCE(SUM(ai_switches_count), 0) as total_switches,
+                    COALESCE(SUM(video_downloads), 0) as total_video_downloads
                 FROM users
             ''').fetchone()
 
@@ -1887,19 +1961,22 @@ def health_check():
                 'memory_usage': SYSTEM_STATUS['memory_usage'],
                 'system_health': SYSTEM_STATUS['system_health'],
                 'active_conversations': SYSTEM_STATUS['active_conversations'],
-                'total_requests': SYSTEM_STATUS['total_requests']
+                'total_requests': SYSTEM_STATUS['total_requests'],
+                'video_downloads': SYSTEM_STATUS['video_downloads']
             },
             'ai_capabilities': {
                 'gemini_available': GEMINI_AVAILABLE and bool(GEMINI_API_KEY),
                 'openai_available': bool(openai_client),
                 'model_switching': True,
                 'specialized_modes': True,
-                'interactive_buttons': True
+                'interactive_buttons': True,
+                'video_downloader': True
             },
             'statistics': {
                 'total_users': stats['total_users'] if stats else 0,
                 'total_messages': stats['total_messages'] if stats else 0,
-                'total_ai_switches': stats['total_switches'] if stats else 0
+                'total_ai_switches': stats['total_switches'] if stats else 0,
+                'total_video_downloads': stats['total_video_downloads'] if stats else 0
             }
         })
     except Exception as e:
@@ -1911,7 +1988,7 @@ def health_check():
 
 @app.route('/dashboard')
 def dashboard():
-    """Enhanced dashboard with comprehensive analytics"""
+    """Enhanced dashboard with video download analytics"""
     global SYSTEM_STATUS
     try:
         with get_db() as conn:
@@ -1922,338 +1999,114 @@ def dashboard():
                     COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified_users,
                     COALESCE(SUM(total_messages), 0) as total_messages,
                     COALESCE(SUM(ai_switches_count), 0) as total_switches,
+                    COALESCE(SUM(video_downloads), 0) as total_video_downloads,
                     COALESCE(AVG(user_rating), 0.0) as avg_rating,
                     COUNT(CASE WHEN last_interaction > datetime('now', '-24 hours') THEN 1 END) as active_24h
                 FROM users
             ''').fetchone()
 
-            # AI model usage statistics
-            ai_usage = conn.execute('''
-                SELECT ai_provider, COUNT(*) as usage_count
-                FROM interactions
-                WHERE timestamp > datetime('now', '-7 days')
-                GROUP BY ai_provider
-            ''').fetchall()
-
-            # Recent interactions
-            recent_interactions = conn.execute('''
-                SELECT u.first_name, i.interaction_type, i.user_message, i.timestamp, 
-                       i.ai_provider, i.ai_model, i.processing_time
-                FROM interactions i
-                JOIN users u ON i.user_id = u.user_id
-                ORDER BY i.timestamp DESC
-                LIMIT 15
+            # Video download statistics
+            video_stats = conn.execute('''
+                SELECT platform, COUNT(*) as count
+                FROM video_downloads
+                WHERE download_status = 'success'
+                GROUP BY platform
             ''').fetchall()
 
         # System status
         uptime_duration = datetime.now() - SYSTEM_STATUS['uptime_start']
 
-        # Enhanced dashboard HTML
-        dashboard_html = f'''
+        # Return dashboard HTML with video stats
+        dashboard_html = f"""
         <!DOCTYPE html>
-        <html lang="en">
+        <html>
         <head>
             <title>{BOT_NAME} - Advanced Analytics Dashboard</title>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta http-equiv="refresh" content="30">
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-            <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
             <style>
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-
                 body {{
                     font-family: 'Inter', sans-serif;
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
                     color: white;
+                    margin: 0;
                     padding: 20px;
                 }}
-
-                .container {{ max-width: 1600px; margin: 0 auto; }}
-
-                .glass-card {{
-                    background: rgba(255, 255, 255, 0.1);
-                    backdrop-filter: blur(15px);
-                    border-radius: 24px;
-                    border: 1px solid rgba(255, 255, 255, 0.2);
-                    padding: 32px;
-                    margin-bottom: 24px;
-                    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
-                    transition: all 0.4s ease;
-                }}
-
-                .glass-card:hover {{
-                    transform: translateY(-4px);
-                    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
-                }}
-
-                .header {{
-                    text-align: center;
-                    margin-bottom: 40px;
-                }}
-
-                .header h1 {{
-                    font-size: 3rem;
-                    margin-bottom: 16px;
-                    background: linear-gradient(45deg, #fff, #4ecdc4);
-                    -webkit-background-clip: text;
-                    -webkit-text-fill-color: transparent;
-                    font-weight: 800;
-                }}
-
-                .stats-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 32px;
-                }}
-
-                .stat-card {{
-                    background: rgba(255, 255, 255, 0.1);
-                    border-radius: 16px;
-                    padding: 24px;
-                    text-align: center;
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    transition: all 0.3s ease;
-                }}
-
-                .stat-card:hover {{
-                    transform: translateY(-4px);
-                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
-                }}
-
-                .stat-number {{
-                    font-size: 2.2rem;
-                    font-weight: 800;
-                    color: #4ecdc4;
-                    margin-bottom: 8px;
-                }}
-
-                .stat-label {{
-                    font-size: 0.9rem;
-                    opacity: 0.8;
-                    font-weight: 500;
-                }}
-
-                .live-indicator {{
-                    position: fixed;
-                    top: 24px;
-                    right: 24px;
-                    background: #4caf50;
-                    padding: 12px 20px;
-                    border-radius: 25px;
-                    font-size: 0.9rem;
-                    font-weight: 600;
-                    z-index: 1000;
-                    animation: pulse 2s infinite;
-                    box-shadow: 0 4px 20px rgba(76, 175, 80, 0.3);
-                }}
-
-                @keyframes pulse {{
-                    0%, 100% {{ opacity: 1; transform: scale(1); }}
-                    50% {{ opacity: 0.8; transform: scale(1.05); }}
-                }}
-
-                .interaction-item {{
-                    background: rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                    padding: 20px;
-                    margin-bottom: 12px;
-                    border-left: 4px solid #4ecdc4;
-                    transition: all 0.3s ease;
-                }}
-
-                .interaction-item:hover {{
-                    background: rgba(255, 255, 255, 0.1);
-                    transform: translateX(4px);
-                }}
-
-                .back-btn {{
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 12px;
-                    background: linear-gradient(135deg, #4ecdc4, #4caf50);
-                    padding: 12px 24px;
-                    border-radius: 25px;
-                    text-decoration: none;
-                    color: white;
-                    margin-bottom: 24px;
-                    transition: all 0.3s ease;
-                    font-weight: 600;
-                }}
-
-                .back-btn:hover {{
-                    transform: translateY(-2px);
-                    box-shadow: 0 8px 25px rgba(78, 205, 196, 0.3);
-                }}
-
-                .feature-status {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                    gap: 20px;
-                    margin-top: 24px;
-                }}
-
-                .feature-card {{
-                    background: linear-gradient(135deg, rgba(76, 175, 80, 0.2), rgba(78, 205, 196, 0.1));
-                    padding: 20px;
-                    border-radius: 16px;
-                    border: 1px solid rgba(76, 175, 80, 0.3);
-                }}
-
-                .ai-usage-chart {{
-                    display: flex;
-                    justify-content: space-around;
-                    margin: 20px 0;
-                }}
-
-                .ai-usage-item {{
-                    text-align: center;
-                    padding: 16px;
-                    background: rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                    min-width: 120px;
-                }}
-
-                @media (max-width: 768px) {{
-                    .container {{ padding: 16px; }}
-                    .header h1 {{ font-size: 2rem; }}
-                    .stats-grid {{ grid-template-columns: repeat(2, 1fr); }}
-                    .feature-status {{ grid-template-columns: 1fr; }}
-                }}
+                .container {{ max-width: 1400px; margin: 0 auto; }}
+                .header {{ text-align: center; margin-bottom: 40px; }}
+                .header h1 {{ font-size: 3rem; margin-bottom: 16px; }}
+                .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 32px; }}
+                .stat-card {{ background: rgba(255, 255, 255, 0.1); border-radius: 16px; padding: 24px; text-align: center; }}
+                .stat-number {{ font-size: 2.2rem; font-weight: 800; color: #4ecdc4; margin-bottom: 8px; }}
+                .stat-label {{ font-size: 0.9rem; opacity: 0.8; }}
+                .glass-card {{ background: rgba(255, 255, 255, 0.1); border-radius: 24px; padding: 32px; margin-bottom: 24px; }}
+                .back-btn {{ display: inline-flex; align-items: center; gap: 12px; background: linear-gradient(135deg, #4ecdc4, #4caf50); padding: 12px 24px; border-radius: 25px; text-decoration: none; color: white; margin-bottom: 24px; }}
             </style>
         </head>
         <body>
-            <div class="live-indicator">
-                🟢 Live Analytics Dashboard
-            </div>
-
             <div class="container">
-                <a href="/" class="back-btn">
-                    <i class="fas fa-arrow-left"></i>
-                    <span>Back to Home</span>
-                </a>
-
-                <div class="glass-card header">
-                    <h1><i class="fas fa-chart-bar"></i> {BOT_NAME} Analytics</h1>
-                    <p style="font-size: 1.2rem; opacity: 0.9;">Advanced AI Performance & Usage Analytics</p>
-                    <p style="margin-top: 16px; opacity: 0.8;">
-                        🚀 Uptime: {str(uptime_duration).split('.')[0]} | 
-                        ⚡ Status: {'ACTIVE' if SYSTEM_STATUS['is_active'] else 'OFFLINE'} |
-                        🔥 Health: {SYSTEM_STATUS['system_health'].upper()}
-                    </p>
+                <a href="/" class="back-btn">← Back to Home</a>
+                
+                <div class="header">
+                    <h1>📊 {BOT_NAME} Analytics Dashboard</h1>
+                    <p>🚀 Uptime: {str(uptime_duration).split('.')[0]} | Status: {'ACTIVE' if SYSTEM_STATUS['is_active'] else 'OFFLINE'}</p>
                 </div>
 
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-number">{user_stats['total_users'] or 0}</div>
-                        <div class="stat-label"><i class="fas fa-users"></i> Total Users</div>
+                        <div class="stat-label">👥 Total Users</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{user_stats['total_messages'] or 0}</div>
-                        <div class="stat-label"><i class="fas fa-comments"></i> Messages Sent</div>
+                        <div class="stat-label">💬 Messages</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{user_stats['total_video_downloads'] or 0}</div>
+                        <div class="stat-label">📺 Video Downloads</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{user_stats['total_switches'] or 0}</div>
-                        <div class="stat-label"><i class="fas fa-exchange-alt"></i> AI Switches</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{user_stats['active_24h'] or 0}</div>
-                        <div class="stat-label"><i class="fas fa-clock"></i> Active (24h)</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{SYSTEM_STATUS['total_requests']}</div>
-                        <div class="stat-label"><i class="fas fa-robot"></i> AI Requests</div>
+                        <div class="stat-label">🔄 AI Switches</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{round(SYSTEM_STATUS['cpu_usage'], 1)}%</div>
-                        <div class="stat-label"><i class="fas fa-microchip"></i> CPU Usage</div>
+                        <div class="stat-label">💻 CPU Usage</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{round(SYSTEM_STATUS['memory_usage'], 1)}%</div>
-                        <div class="stat-label"><i class="fas fa-memory"></i> Memory</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{int(SYSTEM_STATUS['response_time_avg'] * 1000)}ms</div>
-                        <div class="stat-label"><i class="fas fa-tachometer-alt"></i> Response Time</div>
+                        <div class="stat-label">🧠 Memory</div>
                     </div>
                 </div>
 
                 <div class="glass-card">
-                    <h2><i class="fas fa-robot"></i> AI Engine Usage Analytics</h2>
-                    <div class="ai-usage-chart">
-                        {''.join([f'<div class="ai-usage-item"><div style="font-size: 1.5rem; font-weight: bold; color: #4ecdc4;">{row["usage_count"]}</div><div style="font-size: 0.9rem; opacity: 0.8;">{row["ai_provider"]}</div></div>' for row in ai_usage]) if ai_usage else '<p>No AI usage data available</p>'}
+                    <h2>📺 Video Download Statistics</h2>
+                    <div style="display: flex; justify-content: space-around; margin: 20px 0;">
+                        {''.join([f'<div style="text-align: center; padding: 16px;"><div style="font-size: 1.5rem; font-weight: bold; color: #4ecdc4;">{row["count"]}</div><div style="font-size: 0.9rem;">{row["platform"].title()}</div></div>' for row in video_stats]) if video_stats else '<p>No video downloads yet</p>'}
                     </div>
                 </div>
 
                 <div class="glass-card">
-                    <h2><i class="fas fa-cogs"></i> Advanced Features Status</h2>
-                    <div class="feature-status">
-                        <div class="feature-card">
-                            <strong><i class="fas fa-exchange-alt"></i> AI Model Switching</strong><br>
-                            <small>Seamless switching between Gemini, GPT-4, and GPT-3.5</small><br>
-                            <span style="color: #4caf50;">✅ Fully Operational</span>
-                        </div>
-                        <div class="feature-card">
-                            <strong><i class="fas fa-mouse-pointer"></i> Interactive Buttons</strong><br>
-                            <small>Enhanced user experience with responsive buttons</small><br>
-                            <span style="color: #4caf50;">✅ Active on All Responses</span>
-                        </div>
-                        <div class="feature-card">
-                            <strong><i class="fas fa-graduation-cap"></i> Specialized Modes</strong><br>
-                            <small>Student, Creative, Professional, and Coding modes</small><br>
-                            <span style="color: #4caf50;">✅ All Modes Available</span>
-                        </div>
-                        <div class="feature-card">
-                            <strong><i class="fas fa-chart-line"></i> Real-time Analytics</strong><br>
-                            <small>Live system monitoring and user statistics</small><br>
-                            <span style="color: #4caf50;">✅ Live Monitoring Active</span>
-                        </div>
-                        <div class="feature-card">
-                            <strong><i class="fas fa-memory"></i> Conversation Memory</strong><br>
-                            <small>Context-aware responses with memory retention</small><br>
-                            <span style="color: #4caf50;">✅ Memory System Online</span>
-                        </div>
-                        <div class="feature-card">
-                            <strong><i class="fas fa-star"></i> User Feedback</strong><br>
-                            <small>Response rating and feedback collection</small><br>
-                            <span style="color: #4caf50;">✅ Feedback System Active</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="glass-card">
-                    <h2><i class="fas fa-history"></i> Recent AI Interactions</h2>
-                    <div style="max-height: 400px; overflow-y: auto;">
-                        {''.join([f'<div class="interaction-item"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;"><strong>{row["first_name"] or "User"}</strong><span style="background: #4ecdc4; padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; font-weight: 600;">{row["ai_provider"] or "AI"} • {row["ai_model"] or "Model"}</span></div><div style="opacity: 0.9; margin-bottom: 8px;">{(row["user_message"] or "Message")[:120]}{"..." if len(row["user_message"] or "") > 120 else ""}</div><div style="display: flex; justify-content: space-between; font-size: 0.85rem; opacity: 0.7;"><span>{row["timestamp"]}</span><span>⚡ {round(float(row["processing_time"] or 0), 2)}s</span></div></div>' for row in recent_interactions]) if recent_interactions else '<p style="text-align: center; padding: 20px; opacity: 0.7;">No recent interactions available</p>'}
-                    </div>
+                    <h2>✨ Enhanced Features Active</h2>
+                    <ul style="list-style: none; padding: 0;">
+                        <li>✅ Multi-AI Model Switching</li>
+                        <li>✅ Interactive Button Experience</li>
+                        <li>✅ Video Downloader (YouTube, TikTok, Facebook, Instagram)</li>
+                        <li>✅ Specialized AI Modes</li>
+                        <li>✅ Real-time Analytics</li>
+                        <li>✅ 24/7 System Monitoring</li>
+                    </ul>
                 </div>
 
                 <div class="glass-card" style="text-align: center;">
-                    <p style="font-size: 1.1rem; margin-bottom: 8px;">
-                        <em><i class="fas fa-heart"></i> Created with ❤️ by SUNNEL | {BOT_NAME} v{BOT_VERSION}</em>
-                    </p>
-                    <p style="opacity: 0.7; font-size: 0.9rem;">
-                        Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Auto-refresh: 30s
-                    </p>
+                    <p><em>💫 Created by SUNNEL | {BOT_NAME} v{BOT_VERSION}</em></p>
+                    <p style="opacity: 0.7;">Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                 </div>
             </div>
-
-            <script>
-                // Enhanced interactions
-                document.querySelectorAll('.stat-card').forEach(card => {{
-                    card.addEventListener('click', function() {{
-                        this.style.transform = 'scale(0.95)';
-                        setTimeout(() => {{
-                            this.style.transform = 'translateY(-4px)';
-                        }}, 150);
-                    }});
-                }});
-            </script>
         </body>
         </html>
-        '''
+        """
 
         return dashboard_html
 
@@ -2270,11 +2123,12 @@ if __name__ == '__main__':
 
     # Start the Flask app
     print(f"🚀 Starting {BOT_NAME} v{BOT_VERSION}")
-    print("🌟 NEW ENHANCED FEATURES:")
+    print("🌟 ENHANCED FEATURES:")
     print("  • 🔄 AI Model Switching (Gemini ↔ GPT-4 ↔ GPT-3.5)")
+    print("  • 📺 Video Downloader (YouTube, TikTok, Facebook, Instagram)")
     print("  • 🎯 Interactive Buttons on Every Response")
-    print("  • 🎓 Specialized Modes (Student, Creative, Professional, Coding)")
-    print("  • 📊 Comprehensive User Analytics & Statistics")
+    print("  • 🎓 Specialized Modes (Student, Creative, Professional, Coding, Downloader)")
+    print("  • 📊 Comprehensive User Analytics & Video Stats")
     print("  • ⭐ Response Rating & Feedback System")
     print("  • 🧠 Advanced Conversation Memory")
     print("  • 🎨 Enhanced UI with Glass-morphism Design")
