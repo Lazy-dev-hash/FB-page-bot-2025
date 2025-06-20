@@ -6,8 +6,10 @@ authors = ["Your Name <you@example.com>"]
 requires-python = ">=3.11"
 dependencies = [
     "flask>=3.1.1",
-    "google-generativeai>=0.8.5",
     "openai>=1.88.0",
-    "pillow>=11.2.1",
+    "psutil>=7.0.0",
     "requests>=2.32.4",
+    "schedule>=1.2.2",
+    "yt-dlp>=2025.6.9",
+    "pillow>=10.0.0",
 ]
