@@ -12,4 +12,5 @@ dependencies = [
     "schedule>=1.2.2",
     "yt-dlp>=2025.6.9",
     "pillow>=10.0.0",
+    "google-generativeai>=0.8.0",
 ]
